@@ -19,6 +19,16 @@ pub(crate) const PUSH_KINDS: &[u64] = &[9, 40_002, 45_001, 45_003];
 
 /// NIP-PL addressable push-lease event kind.
 pub const KIND_PUSH_LEASE: u32 = 30_350;
+
+/// Lease transports this relay accepts and advertises in NIP-11
+/// `class_support`: APNs always, Web Push when the gateway delivers it.
+pub(crate) fn supported_transports(webpush_enabled: bool) -> &'static [&'static str] {
+    if webpush_enabled {
+        &["apns", "webpush"]
+    } else {
+        &["apns"]
+    }
+}
 /// Largest integer represented exactly by interoperable JSON number implementations.
 pub const MAX_SAFE_JSON_INTEGER: u64 = (1_u64 << 53) - 1;
 
@@ -60,7 +70,7 @@ pub struct Suppress {
 pub struct LeaseLimits<'a> {
     pub expected_origin: &'a str,
     pub author_hex: &'a str,
-    pub transport: &'a str,
+    pub transports: &'a [&'a str],
     pub supported_classes: &'a [&'a str],
     pub push_kinds: &'a [u64],
     pub max_subscriptions: usize,
@@ -206,7 +216,7 @@ pub fn validate_plaintext(body: &LeasePlaintext, limits: &LeaseLimits<'_>) -> Re
     let transport = body.transport.as_deref().ok_or("missing transport")?;
     let endpoint = body.endpoint.as_deref().ok_or("missing endpoint")?;
     let subscriptions = body.subscriptions.as_ref().ok_or("missing subscriptions")?;
-    if transport != limits.transport {
+    if !limits.transports.contains(&transport) {
         return Err("transport mismatch".into());
     }
     if endpoint.is_empty() || endpoint.len() > limits.max_endpoint_len {
@@ -472,7 +482,7 @@ pub async fn accept(
     let limits = LeaseLimits {
         expected_origin: &origin,
         author_hex: &author_hex,
-        transport: "apns",
+        transports: supported_transports(state.config.push_webpush_enabled),
         supported_classes: &["default"],
         push_kinds: PUSH_KINDS,
         max_subscriptions: 16,
@@ -644,7 +654,7 @@ mod tests {
         LeaseLimits {
             expected_origin: "o",
             author_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            transport: "apns",
+            transports: supported_transports(false),
             supported_classes: &["default"],
             push_kinds: &[9],
             max_subscriptions: 4,
@@ -687,6 +697,21 @@ mod tests {
         let body = parse_plaintext(r##"{"v":1,"origin":"o","generation":1,"active":true,"transport":"fcm","endpoint":"token","subscriptions":[{"filter":{"kinds":[9],"#p":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},"class":"default"}]}"##, 4096).unwrap();
         assert_eq!(
             validate_plaintext(&body, &limits()).unwrap_err(),
+            "transport mismatch"
+        );
+        // Browser leases are accepted only where the relay advertises them.
+        let webpush = parse_plaintext(r##"{"v":1,"origin":"o","generation":1,"active":true,"transport":"webpush","endpoint":"grant","subscriptions":[{"filter":{"kinds":[9],"#p":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]},"class":"default"}]}"##, 4096).unwrap();
+        assert_eq!(
+            validate_plaintext(&webpush, &limits()).unwrap_err(),
+            "transport mismatch"
+        );
+        let with_webpush = LeaseLimits {
+            transports: supported_transports(true),
+            ..limits()
+        };
+        validate_plaintext(&webpush, &with_webpush).expect("advertised web push lease");
+        assert_eq!(
+            validate_plaintext(&body, &with_webpush).unwrap_err(),
             "transport mismatch"
         );
 

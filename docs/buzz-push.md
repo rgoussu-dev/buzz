@@ -48,6 +48,12 @@ and in-app notification rule apply the same rule.
 
 ## Web Push installations
 
+A relay started with `BUZZ_PUSH_WEBPUSH_ENABLED=true` (which requires
+`BUZZ_PUSH_ENABLED=true`) adds `"webpush": ["default"]` to `class_support`
+and accepts leases with `"transport": "webpush"`. It is a compatible
+addition: `buzz-push-v1` is unchanged, and clients that know only `apns`
+keep working. Set it only when the relay's gateway has Web Push configured.
+
 A gateway with Web Push configured also enrolls browsers. They follow the
 same installation, delegation and lease model as the iOS app, with two
 differences: the endpoint is a Web Push subscription, and a non-extractable

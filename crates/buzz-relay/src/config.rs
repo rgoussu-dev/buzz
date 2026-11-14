@@ -388,6 +388,10 @@ pub struct Config {
     /// Whether NIP-PL push discovery, lease acceptance, enqueueing, matching, and delivery
     /// are enabled for this deployment. Defaults to false.
     pub push_enabled: bool,
+    /// Whether the configured gateway also delivers Web Push, so browser
+    /// leases (`transport: "webpush"`) are accepted and advertised. Requires
+    /// `push_enabled`. Defaults to false.
+    pub push_webpush_enabled: bool,
     /// Descriptor key identifier accepted in kind:30350 `exec` tags.
     pub push_executor_key_id: String,
     /// Exact HTTP(S) gateway endpoint used to sign and submit APNs delivery capabilities.
@@ -1222,6 +1226,12 @@ impl Config {
                 hex::encode(secret)
             });
         let push_enabled = parse_bool("BUZZ_PUSH_ENABLED", false)?;
+        let push_webpush_enabled = parse_bool("BUZZ_PUSH_WEBPUSH_ENABLED", false)?;
+        if push_webpush_enabled && !push_enabled {
+            return Err(ConfigError::InvalidValue(
+                "BUZZ_PUSH_WEBPUSH_ENABLED=true requires BUZZ_PUSH_ENABLED=true".to_string(),
+            ));
+        }
         let push_executor_key_id =
             std::env::var("BUZZ_PUSH_EXECUTOR_KEY_ID").unwrap_or_else(|_| "relay-v1".to_string());
         if push_executor_key_id.is_empty() || push_executor_key_id.len() > 64 {
@@ -1588,6 +1598,7 @@ impl Config {
             git_max_concurrent_ops,
             git_hook_hmac_secret,
             push_enabled,
+            push_webpush_enabled,
             push_executor_key_id,
             push_gateway_delivery_url,
             push_gateway_timeout,
@@ -2906,7 +2917,23 @@ mod tests {
                 if message.contains("must not be empty")
         ));
 
+        std::env::set_var(
+            "BUZZ_PUSH_GATEWAY_DELIVERY_URL",
+            "https://push.example/v1/deliveries/apns",
+        );
+        assert!(!Config::from_env().unwrap().push_webpush_enabled);
+        std::env::set_var("BUZZ_PUSH_WEBPUSH_ENABLED", "true");
+        assert!(Config::from_env().unwrap().push_webpush_enabled);
+
         std::env::set_var("BUZZ_PUSH_ENABLED", "false");
+        let result = Config::from_env();
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref message))
+                if message.contains("requires BUZZ_PUSH_ENABLED")
+        ));
+        std::env::remove_var("BUZZ_PUSH_WEBPUSH_ENABLED");
+        std::env::remove_var("BUZZ_PUSH_GATEWAY_DELIVERY_URL");
         let config = Config::from_env().expect("disabled push config");
         assert!(config.push_gateway_delivery_url.is_none());
 
