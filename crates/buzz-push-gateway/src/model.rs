@@ -14,6 +14,9 @@ pub const MAX_GRANT_BYTES: usize = 4096;
 pub const MAX_ENDPOINT_HEX_BYTES: usize = 512;
 pub const APNS_RECONNECT_PAYLOAD: &[u8] =
     br#"{"aps":{"alert":{"body":"Reconnect to your relay now"},"sound":"default","mutable-content":1}}"#;
+/// The only Web Push application body, encrypted to the browser (RFC 8291).
+/// Like [`APNS_RECONNECT_PAYLOAD`], it carries nothing from the relay.
+pub const WEBPUSH_WAKE_PAYLOAD: &[u8] = br#"{"v":1}"#;
 pub const WIRE_VERSION: u8 = 1;
 
 /// Relay request. It deliberately has no application-payload field:

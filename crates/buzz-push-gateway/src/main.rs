@@ -7,6 +7,7 @@ use buzz_push_gateway::{
     postgres::PostgresAuthorityStore,
     router_with_metrics,
     token::{TokenKey, TokenKeyring},
+    webpush::{PushServiceAllowlist, VapidKey, WebPushTransport},
     AppState,
 };
 use std::{
@@ -43,24 +44,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c = Config::from_env()?;
     let metrics_handle = buzz_push_gateway::metrics::install()?;
-    let app_attest_root = fs::read(&c.app_attest_root_cert_path)?;
-    let configured = &c.application;
-    let application = {
-        let apple = AppAttestVerifier::with_environment(
-            configured.app_attest_app_id.clone(),
-            app_attest_root,
-            configured.app_attest_environment,
-        )?;
-        tracing::info!(environment = ?apple.environment(), "App Attest verifier configured");
-        let transport = Arc::new(ApnsTransport::certificate(
-            &fs::read(&configured.apns_cert_path)?,
-            configured.apns_topic.clone(),
-            configured.apns_environment,
-        )?);
-        buzz_push_gateway::http::ApplicationRuntime {
-            app_attest: Arc::new(apple),
-            transport,
+    let application = match &c.application {
+        Some(configured) => {
+            let apple = AppAttestVerifier::with_environment(
+                configured.app_attest_app_id.clone(),
+                fs::read(&configured.app_attest_root_cert_path)?,
+                configured.app_attest_environment,
+            )?;
+            tracing::info!(environment = ?apple.environment(), "App Attest verifier configured");
+            let transport = Arc::new(ApnsTransport::certificate(
+                &fs::read(&configured.apns_cert_path)?,
+                configured.apns_topic.clone(),
+                configured.apns_environment,
+            )?);
+            Some(Arc::new(buzz_push_gateway::http::ApplicationRuntime {
+                app_attest: Arc::new(apple),
+                transport,
+            }))
         }
+        None => None,
+    };
+    let webpush = match &c.webpush {
+        Some(configured) => {
+            let vapid = Arc::new(VapidKey::from_pem(
+                &fs::read_to_string(&configured.vapid_key_path)?,
+                &configured.vapid_subject,
+            )?);
+            let allowlist = Arc::new(PushServiceAllowlist::new(
+                configured.allowed_hosts.iter().map(String::as_str),
+            )?);
+            tracing::info!(public_key = vapid.public_key(), "Web Push configured");
+            let transport = Arc::new(WebPushTransport::new(
+                Arc::clone(&vapid),
+                Arc::clone(&allowlist),
+                || chrono::Utc::now().timestamp(),
+            )?);
+            Some(Arc::new(buzz_push_gateway::http::WebPushRuntime {
+                vapid,
+                allowlist,
+                transport,
+            }))
+        }
+        None => None,
     };
     let grant_keyring = GrantKeyring::new(
         c.grant_keys
@@ -104,7 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             grant_keyring: Arc::new(grant_keyring),
             authority,
             token_keyring: Arc::new(token_keyring),
-            application: Arc::new(application),
+            application,
+            webpush,
             max_grant_lifetime_seconds: c.max_grant_lifetime_seconds,
             max_installation_lifetime_seconds: c.max_installation_lifetime_seconds,
             endpoint_quota_window_seconds: c.endpoint_quota_window_seconds,

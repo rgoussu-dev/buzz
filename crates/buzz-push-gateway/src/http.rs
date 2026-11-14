@@ -43,14 +43,24 @@ pub struct ApplicationRuntime {
     pub transport: Arc<dyn PushTransport>,
 }
 
+/// Web Push identity, accepted push services, and delivery.
+#[derive(Clone)]
+pub struct WebPushRuntime {
+    pub vapid: Arc<crate::webpush::VapidKey>,
+    pub allowlist: Arc<crate::webpush::PushServiceAllowlist>,
+    pub transport: Arc<dyn PushTransport>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub grant_keyring: Arc<GrantKeyring>,
     pub authority: Arc<dyn AuthorityStore>,
     pub token_keyring: Arc<TokenKeyring>,
-    /// Server-owned application identity and APNs transport.
-    /// App Attest verifies the configured app ID.
-    pub application: Arc<ApplicationRuntime>,
+    /// Server-owned application identity and APNs transport, when
+    /// configured. App Attest verifies the configured app ID.
+    pub application: Option<Arc<ApplicationRuntime>>,
+    /// Web Push transport, when configured.
+    pub webpush: Option<Arc<WebPushRuntime>>,
     pub max_grant_lifetime_seconds: i64,
     pub max_installation_lifetime_seconds: i64,
     pub endpoint_quota_window_seconds: i64,
@@ -131,6 +141,10 @@ fn authority_error(e: AuthorityError) -> Response {
         }
     }
 }
+/// The route's transport isn't configured on this gateway.
+fn transport_unavailable() -> Response {
+    error(StatusCode::NOT_FOUND, "transport_unavailable")
+}
 fn installation_conflict() -> Response {
     error(StatusCode::CONFLICT, "installation_conflict")
 }
@@ -199,6 +213,9 @@ struct EnrollTranscript<'a> {
     expires_at: i64,
 }
 async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
+    let Some(application) = s.application.as_ref() else {
+        return transport_unavailable();
+    };
     let r: InstallationEnrollRequest = match crate::strict_json::from_slice(&body) {
         Ok(r) => r,
         Err(_) => return error(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -234,7 +251,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
         Some(v) => v,
         None => return error(StatusCode::BAD_REQUEST, "invalid_request"),
     };
-    let verified = match s.application.app_attest.verify_attestation(
+    let verified = match application.app_attest.verify_attestation(
         &r.attestation,
         &r.key_id,
         signed.as_bytes(),
@@ -321,6 +338,7 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     signed: &T,
     include_revoked: bool,
 ) -> Result<(), Response> {
+    let application = s.application.as_ref().ok_or_else(transport_unavailable)?;
     let now = (s.now)();
     let challenge_bytes = decode_challenge(challenge.text)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -334,8 +352,7 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     .map_err(authority_error)?;
     let transcript = transcript(domain, signed)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let verified = s
-        .application
+    let verified = application
         .app_attest
         .verify_assertion(
             assertion,
@@ -674,6 +691,12 @@ async fn deliver(
     {
         return error(StatusCode::NOT_FOUND, "invalid_grant");
     }
+    // Every installation is an APNs one until web enrolment exists. Without
+    // APNs nothing can be delivered: refuse before admission, so no replay
+    // fence or quota is spent.
+    let Some(application) = s.application.clone() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "configuration_fault");
+    };
     let permit = match s
         .authority
         .authorize_delivery(
@@ -715,9 +738,9 @@ async fn deliver(
             return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
         }
     };
-    let transport = Arc::clone(&s.application.transport);
+    let transport = Arc::clone(&application.transport);
     let endpoint = match s.token_keyring.open(&permit.authority.token_ciphertext) {
-        Ok(token) => hex::encode(token),
+        Ok(token) => token,
         Err(_) => {
             crate::metrics::record_delivery_error("token_custody");
             let _ = s
@@ -874,7 +897,7 @@ mod request_limit_tests {
 
     #[async_trait::async_trait]
     impl PushTransport for NeverTransport {
-        async fn send(&self, _: DeliveryAttempt, _: &str) -> DeliveryOutcome {
+        async fn send(&self, _: DeliveryAttempt, _: &[u8]) -> DeliveryOutcome {
             panic!("request-size tests never send to APNs")
         }
     }
@@ -897,10 +920,11 @@ mod request_limit_tests {
             token_keyring: Arc::new(
                 TokenKeyring::new(vec![TokenKey::new("test", &[2; 32]).unwrap()]).unwrap(),
             ),
-            application: Arc::new(ApplicationRuntime {
+            application: Some(Arc::new(ApplicationRuntime {
                 app_attest: Arc::new(app_attest),
                 transport: Arc::new(NeverTransport),
-            }),
+            })),
+            webpush: None,
             max_grant_lifetime_seconds: 86_400,
             max_installation_lifetime_seconds: 86_400,
             endpoint_quota_window_seconds: 60,
@@ -942,6 +966,49 @@ mod request_limit_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn app_attest_routes_without_apns_answer_transport_unavailable() {
+        let mut state = state();
+        state.application = None;
+        let delegation = serde_json::to_vec(&DelegationRequest {
+            v: WIRE_VERSION,
+            challenge_id: uuid::Uuid::nil(),
+            challenge: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0; 32]),
+            installation_handle: uuid::Uuid::nil(),
+            endpoint_epoch: 1,
+            generation: 1,
+            relay_pubkey: "11".repeat(32),
+            not_before: fixed_now(),
+            expires_at: fixed_now() + 60,
+            assertion: STANDARD.encode([0; 8]),
+        })
+        .unwrap();
+        for (path, body) in [
+            ("/v1/installations", maximum_enrollment_body()),
+            ("/v1/delegations", delegation),
+        ] {
+            let (public, _) = router(state.clone());
+            let response = public
+                .oneshot(
+                    Request::post(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                &bytes[..],
+                br#"{"error":"transport_unavailable"}"#,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]

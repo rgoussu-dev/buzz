@@ -72,11 +72,12 @@ pub struct DeliveryAttempt {
     pub expires_at: i64,
 }
 
-/// APNs sender abstraction for live-validation tests.
+/// Push sender abstraction: APNs, Web Push, and test doubles.
 #[async_trait]
 pub trait PushTransport: Send + Sync {
-    /// Send one durable job.
-    async fn send(&self, attempt: DeliveryAttempt, endpoint: &str) -> DeliveryOutcome;
+    /// Send one durable job to `endpoint`, the installation's opened token
+    /// custody bytes: an APNs device token, or a Web Push subscription.
+    async fn send(&self, attempt: DeliveryAttempt, endpoint: &[u8]) -> DeliveryOutcome;
 }
 
 /// Direct HTTP/2 APNs transport using a client certificate identity.
@@ -164,9 +165,9 @@ struct ApnsErrorBody {
 
 #[async_trait]
 impl PushTransport for ApnsTransport {
-    async fn send(&self, attempt: DeliveryAttempt, endpoint: &str) -> DeliveryOutcome {
+    async fn send(&self, attempt: DeliveryAttempt, endpoint: &[u8]) -> DeliveryOutcome {
         crate::metrics::record_apns_send_attempt();
-        let response = self.send_response(attempt, endpoint).await;
+        let response = self.send_response(attempt, &hex::encode(endpoint)).await;
         let response = match response {
             Ok(response) => response,
             Err(_) => {
@@ -268,8 +269,8 @@ mod tests {
         )
         .unwrap();
         for (request_id, expires_at, endpoint) in [
-            (uuid::Uuid::nil(), 1, "00".repeat(32)),
-            (uuid::Uuid::max(), i64::MAX, "ff".repeat(32)),
+            (uuid::Uuid::nil(), 1, [0x00; 32]),
+            (uuid::Uuid::max(), i64::MAX, [0xff; 32]),
         ] {
             assert_eq!(
                 transport
