@@ -48,6 +48,14 @@ invalidate the endpoint; 401 and 403 are configuration faults and never do.
 Egress needs HTTPS to the allowed hosts. The Helm chart does not set these
 variables yet.
 
+| Variable | Purpose |
+|---|---|
+| `BUZZ_PUSH_CORS_ORIGINS` | Optional. Comma-separated origins (`https://app.example.org`) whose pages may call the browser routes: challenges, web enrollment and subscription replacement, the VAPID key, delegation and revocation. APNs enrollment and rotation, and relay delivery, never answer CORS. Without it, browsers can't use the gateway. |
+
+Without Web Push, the browser enrollment routes and `GET /v1/webpush/key`
+answer `404 transport_unavailable`. See [Buzz push notes](buzz-push.md) for
+the browser request formats.
+
 Each gateway serves one configured Apple application. App Attest validates
 `application.appAttestAppId` (`TEAMID.bundle-id`) before enrollment. APNs uses
 the configured topic, certificate and environment. Clients and relay grants

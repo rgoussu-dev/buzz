@@ -20,7 +20,6 @@ use p256::{
     PublicKey, SecretKey,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;
 use url::Url;
@@ -38,8 +37,10 @@ pub const DEFAULT_PUSH_SERVICE_HOSTS: &[&str] = &[
     "*.notify.windows.com",
 ];
 
-/// Longest subscription endpoint URL accepted, in bytes.
-pub const MAX_SUBSCRIPTION_ENDPOINT_BYTES: usize = 2048;
+/// Longest subscription endpoint URL accepted, in bytes: what fits in token
+/// custody next to the keys. Real push services use a few hundred.
+pub const MAX_SUBSCRIPTION_ENDPOINT_BYTES: usize =
+    crate::token::MAX_CUSTODY_BYTES - CUSTODY_HEADER_BYTES;
 
 /// RFC 8188 record size advertised in the content-coding header. The single
 /// record (payload, delimiter and tag) is far smaller.
@@ -177,14 +178,10 @@ pub struct Subscription {
     auth: [u8; 16],
 }
 
-/// Custody form of a subscription, sealed with the token keyring.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StoredSubscription {
-    endpoint: String,
-    p256dh: String,
-    auth: String,
-}
+/// Version byte of a subscription's custody form.
+const CUSTODY_VERSION: u8 = 1;
+/// Custody form: version, `p256dh` (65 bytes), `auth` (16), endpoint URL.
+const CUSTODY_HEADER_BYTES: usize = 1 + 65 + 16;
 
 impl Subscription {
     /// Validate a subscription as the browser reports it: the endpoint URL,
@@ -228,12 +225,16 @@ impl Subscription {
 
     /// Bytes to seal for custody; [`Subscription::from_bytes`] reverses it.
     pub fn to_bytes(&self) -> Result<Vec<u8>, WebPushError> {
-        let stored = StoredSubscription {
-            endpoint: self.endpoint.as_str().to_owned(),
-            p256dh: URL_SAFE_NO_PAD.encode(self.p256dh.to_sec1_bytes()),
-            auth: URL_SAFE_NO_PAD.encode(self.auth),
-        };
-        serde_json::to_vec(&stored).map_err(|_| WebPushError::Subscription)
+        let p256dh = self.p256dh.to_sec1_bytes();
+        if p256dh.len() != 65 {
+            return Err(WebPushError::Subscription);
+        }
+        let mut bytes = Vec::with_capacity(CUSTODY_HEADER_BYTES + self.endpoint.as_str().len());
+        bytes.push(CUSTODY_VERSION);
+        bytes.extend_from_slice(&p256dh);
+        bytes.extend_from_slice(&self.auth);
+        bytes.extend_from_slice(self.endpoint.as_str().as_bytes());
+        Ok(bytes)
     }
 
     /// Read custody bytes, checking them against the current allowlist.
@@ -241,9 +242,83 @@ impl Subscription {
         bytes: &[u8],
         allowlist: &PushServiceAllowlist,
     ) -> Result<Self, WebPushError> {
-        let stored: StoredSubscription =
-            crate::strict_json::from_slice(bytes).map_err(|_| WebPushError::Subscription)?;
-        Self::new(&stored.endpoint, &stored.p256dh, &stored.auth, allowlist)
+        if bytes.len() <= CUSTODY_HEADER_BYTES || bytes[0] != CUSTODY_VERSION {
+            return Err(WebPushError::Subscription);
+        }
+        let endpoint = std::str::from_utf8(&bytes[CUSTODY_HEADER_BYTES..])
+            .map_err(|_| WebPushError::Subscription)?;
+        Self::new(
+            endpoint,
+            &URL_SAFE_NO_PAD.encode(&bytes[1..66]),
+            &URL_SAFE_NO_PAD.encode(&bytes[66..CUSTODY_HEADER_BYTES]),
+            allowlist,
+        )
+    }
+
+    /// Fingerprint that keeps one subscription enrolled once. Domain
+    /// separated from APNs tokens.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::Digest;
+        let mut h = Sha256::new();
+        h.update(b"buzz-webpush-endpoint-v1\0");
+        h.update(self.endpoint.as_str().as_bytes());
+        h.finalize().into()
+    }
+}
+
+/// A browser installation's authority key: the public half of a
+/// non-extractable Web Crypto ECDSA P-256 key, uncompressed SEC1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationKey(PublicKey);
+
+impl InstallationKey {
+    /// Parse the base64url uncompressed point a browser exports (`raw`).
+    pub fn from_base64url(value: &str) -> Result<Self, WebPushError> {
+        Self::from_sec1(
+            &URL_SAFE_NO_PAD
+                .decode(value.trim_end_matches('='))
+                .map_err(|_| WebPushError::Subscription)?,
+        )
+    }
+
+    /// Parse stored uncompressed SEC1 bytes.
+    pub fn from_sec1(bytes: &[u8]) -> Result<Self, WebPushError> {
+        if bytes.len() != 65 || bytes[0] != 0x04 {
+            return Err(WebPushError::Subscription);
+        }
+        PublicKey::from_sec1_bytes(bytes)
+            .map(Self)
+            .map_err(|_| WebPushError::Subscription)
+    }
+
+    /// Uncompressed SEC1 bytes, as stored.
+    pub fn to_sec1(&self) -> Vec<u8> {
+        self.0.to_sec1_bytes().into_vec()
+    }
+
+    /// Stored key id. Domain separated from App Attest key ids, which are
+    /// plain SHA-256 digests of their keys.
+    pub fn id(&self) -> Vec<u8> {
+        use sha2::Digest;
+        let mut h = Sha256::new();
+        h.update(b"buzz-webpush-key-v1\0");
+        h.update(self.0.to_sec1_bytes());
+        h.finalize().to_vec()
+    }
+
+    /// Check a Web Crypto `ECDSA`/`SHA-256` signature (raw `r || s`,
+    /// base64url) over `message`.
+    pub fn verify(&self, message: &[u8], signature: &str) -> bool {
+        use p256::ecdsa::{signature::Verifier, VerifyingKey};
+        let Ok(bytes) = URL_SAFE_NO_PAD.decode(signature.trim_end_matches('=')) else {
+            return false;
+        };
+        let Ok(signature) = Signature::from_slice(&bytes) else {
+            return false;
+        };
+        VerifyingKey::from(&self.0)
+            .verify(message, &signature)
+            .is_ok()
     }
 }
 
@@ -490,6 +565,7 @@ impl PushTransport for WebPushTransport {
 mod tests {
     use super::*;
     use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post, Router};
+    use serde::Deserialize;
     use std::sync::Mutex;
 
     fn b64(value: &str) -> Vec<u8> {
@@ -674,6 +750,44 @@ mod tests {
         let narrowed = PushServiceAllowlist::new(["web.push.apple.com"]).unwrap();
         assert!(Subscription::from_bytes(&subscription.to_bytes().unwrap(), &narrowed).is_err());
         assert!(Subscription::from_bytes(br#"{"endpoint":"x"}"#, &list).is_err());
+        let mut wrong_version = subscription.to_bytes().unwrap();
+        wrong_version[0] = 2;
+        assert!(Subscription::from_bytes(&wrong_version, &list).is_err());
+        assert!(Subscription::from_bytes(&wrong_version[..CUSTODY_HEADER_BYTES], &list).is_err());
+
+        // The longest endpoint fits token custody; one byte more is refused.
+        let prefix = "https://fcm.googleapis.com/";
+        let longest = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_SUBSCRIPTION_ENDPOINT_BYTES - prefix.len())
+        );
+        let keyring = crate::token::TokenKeyring::new(vec![crate::token::TokenKey::new(
+            "test-token-key-id-of-32-bytes-ok",
+            &[7; 32],
+        )
+        .unwrap()])
+        .unwrap();
+        let sealed = keyring
+            .seal(
+                &Subscription::new(&longest, UA_PUBLIC, AUTH, &list)
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(sealed.len() <= 2048);
+        assert!(Subscription::new(&format!("{longest}a"), UA_PUBLIC, AUTH, &list).is_err());
+        assert_ne!(
+            subscription.fingerprint(),
+            Subscription::new(
+                "https://fcm.googleapis.com/fcm/send/abd",
+                UA_PUBLIC,
+                AUTH,
+                &list
+            )
+            .unwrap()
+            .fingerprint()
+        );
     }
 
     fn vapid() -> VapidKey {

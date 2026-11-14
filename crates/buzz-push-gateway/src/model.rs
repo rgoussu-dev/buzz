@@ -82,6 +82,64 @@ pub struct InstallationEnrollResponse {
     pub expires_at: i64,
 }
 
+/// A browser push subscription: the `endpoint` and `keys` of
+/// `PushSubscription.toJSON()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSubscription {
+    pub endpoint: String,
+    pub keys: WebSubscriptionKeys,
+}
+
+/// The subscription's encryption keys, base64url as browsers report them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSubscriptionKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+/// Browser enrollment. `public_key` is the installation's Web Crypto P-256
+/// key (uncompressed SEC1, base64url); it is the installation authority, as
+/// the App Attest key is for APNs. `signature` is that key's ECDSA P-256
+/// SHA-256 signature (raw `r || s`, base64url) over the request transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebEnrollRequest {
+    pub v: u8,
+    pub challenge_id: uuid::Uuid,
+    pub challenge: String,
+    pub public_key: String,
+    pub subscription: WebSubscription,
+    pub endpoint_epoch: i64,
+    pub expires_at: i64,
+    pub signature: String,
+}
+
+/// Replace a browser installation's subscription
+/// (`pushsubscriptionchange`), signed like [`WebEnrollRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebRotateEndpointRequest {
+    pub v: u8,
+    pub challenge_id: uuid::Uuid,
+    pub challenge: String,
+    pub installation_handle: uuid::Uuid,
+    pub endpoint_epoch: i64,
+    pub new_endpoint_epoch: i64,
+    pub subscription: WebSubscription,
+    pub signature: String,
+}
+
+/// The gateway's VAPID public key: the browser's `applicationServerKey`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebPushKeyResponse {
+    pub public_key: String,
+}
+
+/// `assertion` is an App Attest assertion for an APNs installation, and the
+/// installation key's signature (as in [`WebEnrollRequest`]) for a browser
+/// one. The same holds for the rotate and revoke requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelegationRequest {

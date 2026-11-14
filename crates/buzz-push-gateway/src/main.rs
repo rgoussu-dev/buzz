@@ -137,6 +137,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             endpoint_quota_max_deliveries: c.endpoint_quota_max_deliveries,
             now: || chrono::Utc::now().timestamp(),
             accepting: accepting.clone(),
+            cors_origins: c
+                .cors_origins
+                .iter()
+                .map(|origin| axum::http::HeaderValue::from_str(origin))
+                .collect::<Result<_, _>>()?,
         },
         Some(metrics_handle),
     );

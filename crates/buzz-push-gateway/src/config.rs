@@ -60,6 +60,9 @@ pub struct Config {
     pub application: Option<ApplicationConfig>,
     /// Web Push transport, if configured. At least one transport is.
     pub webpush: Option<WebPushConfig>,
+    /// Origins allowed to call the browser routes, as serialized origins
+    /// (`https://app.example.org`). Empty: no CORS.
+    pub cors_origins: Vec<String>,
     pub database_url: String,
     /// Ordered current key first, followed by decrypt-only predecessors.
     pub grant_keys: Vec<KeyConfig>,
@@ -71,6 +74,11 @@ pub struct Config {
 // Registered NIP-PL v1 App Attest audiences are protocol constants, not routing URLs.
 /// Fixed NIP-PL v1 App Attest audience for installation enrollment.
 pub const ENROLL_AUDIENCE: &str = "https://push.buzz.xyz/v1/installations";
+/// Fixed audience for browser installation enrollment.
+pub const WEB_ENROLL_AUDIENCE: &str = "https://push.buzz.xyz/v1/installations/web";
+/// Fixed audience for replacing a browser installation's subscription.
+pub const WEB_ROTATE_ENDPOINT_AUDIENCE: &str =
+    "https://push.buzz.xyz/v1/installations/web/endpoint";
 /// Fixed NIP-PL v1 App Attest audience for creating a delegation.
 pub const DELEGATE_AUDIENCE: &str = "https://push.buzz.xyz/v1/delegations";
 /// Fixed NIP-PL v1 App Attest audience for rotating an installation endpoint.
@@ -142,6 +150,26 @@ const WEBPUSH_VARIABLES: &[&str] = &[
     "BUZZ_PUSH_VAPID_SUBJECT",
     "BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS",
 ];
+
+fn parse_cors_origins(e: &HashMap<String, String>) -> Result<Vec<String>, ConfigError> {
+    const KEY: &str = "BUZZ_PUSH_CORS_ORIGINS";
+    let Some(value) = e.get(KEY) else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(|origin| {
+            let origin = origin.trim();
+            // Only a bare origin: what a browser sends in `Origin`.
+            url::Url::parse(origin)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .map(|url| url.origin().ascii_serialization())
+                .filter(|serialized| serialized == origin)
+                .ok_or(ConfigError::Invalid(KEY))
+        })
+        .collect()
+}
 
 fn parse_webpush(e: &HashMap<String, String>) -> Result<Option<WebPushConfig>, ConfigError> {
     if !WEBPUSH_VARIABLES.iter().any(|key| e.contains_key(*key)) {
@@ -275,6 +303,7 @@ impl Config {
         if application.is_none() && webpush.is_none() {
             return Err(ConfigError::NoTransport);
         }
+        let cors_origins = parse_cors_origins(e)?;
         let bind_addr = e
             .get("BUZZ_PUSH_BIND_ADDR")
             .map(String::as_str)
@@ -296,6 +325,7 @@ impl Config {
             endpoint_quota_max_deliveries,
             application,
             webpush,
+            cors_origins,
             database_url: req(e, "DATABASE_URL")?.to_owned(),
             grant_keys,
             token_keys,
@@ -494,6 +524,39 @@ mod tests {
                 matches!(
                     Config::from_map(&env),
                     Err(ConfigError::Invalid("BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS"))
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_origins_are_bare_origins() {
+        assert!(Config::from_map(&base()).unwrap().cors_origins.is_empty());
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_CORS_ORIGINS".into(),
+            "https://app.example.org, http://localhost:5173".into(),
+        );
+        assert_eq!(
+            Config::from_map(&env).unwrap().cors_origins,
+            vec!["https://app.example.org", "http://localhost:5173"]
+        );
+        for value in [
+            "",
+            "*",
+            "app.example.org",
+            "https://app.example.org/",
+            "https://app.example.org/path",
+            "https://user@app.example.org",
+            "ftp://app.example.org",
+            "https://app.example.org,",
+        ] {
+            env.insert("BUZZ_PUSH_CORS_ORIGINS".into(), value.into());
+            assert!(
+                matches!(
+                    Config::from_map(&env),
+                    Err(ConfigError::Invalid("BUZZ_PUSH_CORS_ORIGINS"))
                 ),
                 "{value:?}"
             );

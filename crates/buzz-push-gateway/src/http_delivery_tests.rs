@@ -8,7 +8,7 @@ use std::sync::{
 use crate::{
     apns::{DeliveryAttempt, DeliveryOutcome, PushTransport},
     app_attest::AppAttestVerifier,
-    authority::{AuthorityStore, Delegation, MemoryAuthorityStore, NewInstallation},
+    authority::{AuthorityStore, Delegation, MemoryAuthorityStore, NewInstallation, Transport},
     grant::{GrantKey, GrantKeyring},
     http::ApplicationRuntime,
     model::EndpointGrant,
@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries/apns";
+pub(crate) const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries/apns";
 const FORWARDED_URL: &str = "https://push.example/v1/deliveries/apns";
 
 struct TestTransport(Arc<AtomicUsize>);
@@ -59,6 +59,7 @@ async fn fixture_with(apns: bool) -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsi
         .create_installation(
             NewInstallation {
                 id: installation_id,
+                transport: Transport::Apns,
                 app_attest_key_id: vec![3; 32],
                 app_attest_public_key: vec![4; 65],
                 assertion_counter: 0,
@@ -121,6 +122,7 @@ async fn fixture_with(apns: bool) -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsi
         endpoint_quota_max_deliveries: 10,
         now,
         accepting: Arc::new(AtomicBool::new(true)),
+        cors_origins: Vec::new(),
     });
     let body = serde_json::to_vec(&serde_json::json!({
         "v": 1, "endpoint_grant": grant, "request_id": Uuid::new_v4(), "expires_at": now() + 60,
@@ -129,7 +131,7 @@ async fn fixture_with(apns: bool) -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsi
     (app, keys, body, sends)
 }
 
-fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
+pub(crate) fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
     let hash = hex::encode(Sha256::digest(body));
     let event = EventBuilder::new(Kind::HttpAuth, "")
         .tags([
@@ -145,7 +147,12 @@ fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
     )
 }
 
-fn request(url: &str, proto: Option<&str>, auth: String, body: Vec<u8>) -> Request<Body> {
+pub(crate) fn request(
+    url: &str,
+    proto: Option<&str>,
+    auth: String,
+    body: Vec<u8>,
+) -> Request<Body> {
     let url = url::Url::parse(url).unwrap();
     let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
     let path = &url[url::Position::BeforePath..url::Position::AfterQuery];

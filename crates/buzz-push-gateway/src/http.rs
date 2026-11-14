@@ -3,15 +3,18 @@ use crate::{
     apns::{DeliveryAttempt, DeliveryOutcome, PushTransport},
     app_attest::AppAttestVerifier,
     authority::{
-        AuthorityError, AuthorityStore, Challenge, Delegation, DeliveryDisposition, NewInstallation,
+        AuthorityError, AuthorityStore, Challenge, Delegation, DeliveryDisposition, Installation,
+        NewInstallation, Transport,
     },
     config::{
         DELEGATE_AUDIENCE, ENROLL_AUDIENCE, REVOKE_DELEGATION_AUDIENCE,
-        REVOKE_INSTALLATION_AUDIENCE, ROTATE_ENDPOINT_AUDIENCE,
+        REVOKE_INSTALLATION_AUDIENCE, ROTATE_ENDPOINT_AUDIENCE, WEB_ENROLL_AUDIENCE,
+        WEB_ROTATE_ENDPOINT_AUDIENCE,
     },
     grant::GrantKeyring,
     model::*,
     token::TokenKeyring,
+    webpush::{InstallationKey, Subscription},
 };
 use axum::{
     body::Bytes,
@@ -67,6 +70,8 @@ pub struct AppState {
     pub endpoint_quota_max_deliveries: i64,
     pub now: fn() -> i64,
     pub accepting: Arc<AtomicBool>,
+    /// Origins allowed to call the browser routes (CORS). Empty: none.
+    pub cors_origins: Vec<axum::http::HeaderValue>,
 }
 fn error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(ErrorBody { error: code })).into_response()
@@ -300,6 +305,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
     let id = uuid::Uuid::new_v4();
     let n = NewInstallation {
         id,
+        transport: Transport::Apns,
         app_attest_key_id: verified.key_id,
         app_attest_public_key: verified.public_key,
         assertion_counter: 0,
@@ -337,8 +343,7 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     domain: &str,
     signed: &T,
     include_revoked: bool,
-) -> Result<(), Response> {
-    let application = s.application.as_ref().ok_or_else(transport_unavailable)?;
+) -> Result<Installation, Response> {
     let now = (s.now)();
     let challenge_bytes = decode_challenge(challenge.text)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
@@ -352,29 +357,49 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     .map_err(authority_error)?;
     let transcript = transcript(domain, signed)
         .ok_or_else(|| error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    let verified = application
-        .app_attest
-        .verify_assertion(
-            assertion,
-            transcript.as_bytes(),
-            &installation.app_attest_public_key,
-            installation.assertion_counter,
-            challenge.text,
-            challenge.text,
-        )
-        .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_attestation"))?;
-    s.authority
-        .consume_challenge(challenge.id, challenge_bytes, now)
-        .await
-        .map_err(authority_error)?;
-    s.authority
-        .advance_assertion_counter(
-            installation_id,
-            installation.assertion_counter,
-            verified.counter,
-        )
-        .await
-        .map_err(authority_error)
+    match installation.transport {
+        Transport::Apns => {
+            let application = s.application.as_ref().ok_or_else(transport_unavailable)?;
+            let verified = application
+                .app_attest
+                .verify_assertion(
+                    assertion,
+                    transcript.as_bytes(),
+                    &installation.app_attest_public_key,
+                    installation.assertion_counter,
+                    challenge.text,
+                    challenge.text,
+                )
+                .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_attestation"))?;
+            s.authority
+                .consume_challenge(challenge.id, challenge_bytes, now)
+                .await
+                .map_err(authority_error)?;
+            s.authority
+                .advance_assertion_counter(
+                    installation_id,
+                    installation.assertion_counter,
+                    verified.counter,
+                )
+                .await
+                .map_err(authority_error)?;
+        }
+        Transport::WebPush => {
+            s.webpush.as_ref().ok_or_else(transport_unavailable)?;
+            let key = InstallationKey::from_sec1(&installation.app_attest_public_key)
+                .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"))?;
+            if !key.verify(transcript.as_bytes(), assertion) {
+                return Err(error(StatusCode::UNAUTHORIZED, "invalid_signature"));
+            }
+            // The single-use challenge is the replay fence; a Web Crypto key
+            // has no counter.
+            s.authority
+                .consume_challenge(challenge.id, challenge_bytes, now)
+                .await
+                .map_err(authority_error)?;
+        }
+    }
+    Ok(installation)
 }
 
 #[derive(serde::Serialize)]
@@ -501,7 +526,7 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
         new_endpoint_epoch: r.new_endpoint_epoch,
         endpoint: &r.endpoint,
     };
-    if let Err(e) = verify_installation_assertion(
+    let installation = match verify_installation_assertion(
         &s,
         r.installation_handle,
         AssertionChallenge {
@@ -515,7 +540,12 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
     )
     .await
     {
-        return e;
+        Ok(installation) => installation,
+        Err(e) => return e,
+    };
+    // An APNs token can't replace a browser subscription.
+    if installation.transport != Transport::Apns {
+        return error(StatusCode::NOT_FOUND, "not_authorized");
     }
     let ciphertext = match s.token_keyring.seal(&token) {
         Ok(v) => v,
@@ -691,12 +721,6 @@ async fn deliver(
     {
         return error(StatusCode::NOT_FOUND, "invalid_grant");
     }
-    // Every installation is an APNs one until web enrolment exists. Without
-    // APNs nothing can be delivered: refuse before admission, so no replay
-    // fence or quota is spent.
-    let Some(application) = s.application.clone() else {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "configuration_fault");
-    };
     let permit = match s
         .authority
         .authorize_delivery(
@@ -738,7 +762,21 @@ async fn deliver(
             return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
         }
     };
-    let transport = Arc::clone(&application.transport);
+    let kind = permit.authority.transport;
+    let transport = match kind {
+        Transport::Apns => s.application.as_ref().map(|a| Arc::clone(&a.transport)),
+        Transport::WebPush => s.webpush.as_ref().map(|w| Arc::clone(&w.transport)),
+    };
+    let Some(transport) = transport else {
+        // The installation's transport was configured when it enrolled and
+        // isn't now. Release the request id so the relay may retry once it is.
+        crate::metrics::record_delivery_error("transport_unavailable");
+        let _ = s
+            .authority
+            .finish_delivery(permit, DeliveryDisposition::Retryable)
+            .await;
+        return error(StatusCode::SERVICE_UNAVAILABLE, "configuration_fault");
+    };
     let endpoint = match s.token_keyring.open(&permit.authority.token_ciphertext) {
         Ok(token) => token,
         Err(_) => {
@@ -760,7 +798,14 @@ async fn deliver(
     let delivery = tokio::spawn(async move {
         let started = std::time::Instant::now();
         let outcome = transport.send(attempt, &endpoint).await;
-        crate::metrics::record_apns_delivery(outcome, started.elapsed().as_secs_f64());
+        match kind {
+            Transport::Apns => {
+                crate::metrics::record_apns_delivery(outcome, started.elapsed().as_secs_f64())
+            }
+            Transport::WebPush => {
+                crate::metrics::record_webpush_delivery(outcome, started.elapsed().as_secs_f64())
+            }
+        }
         let disposition = match outcome {
             DeliveryOutcome::Retry { .. } | DeliveryOutcome::ConfigurationFault => {
                 DeliveryDisposition::Retryable
@@ -840,16 +885,34 @@ pub fn router_with_metrics(
     let enrollment = Router::new()
         .route("/v1/installations", post(enroll))
         .layer(RequestBodyLimitLayer::new(MAX_ENROLL_REQUEST_BYTES));
-    let standard_requests = Router::new()
+    // Routes a browser installation calls from the page: CORS applies here
+    // only. APNs enrollment and rotation, and relay delivery, never come
+    // from a browser.
+    let mut browser_requests = Router::new()
         .route("/v1/installations/challenges", post(challenge))
+        .route("/v1/installations/web", post(enroll_web))
+        .route("/v1/installations/web/endpoint", post(rotate_web_endpoint))
+        .route("/v1/webpush/key", get(webpush_key))
         .route("/v1/delegations", post(delegate))
         .route("/v1/delegations/revoke", post(revoke_delegation))
-        .route("/v1/installations/endpoint", post(rotate_endpoint))
         .route("/v1/installations/revoke", post(revoke_installation))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+    if !state.cors_origins.is_empty() {
+        browser_requests = browser_requests.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(state.cors_origins.clone())
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([axum::http::header::CONTENT_TYPE])
+                .max_age(Duration::from_secs(3600)),
+        );
+    }
+    let standard_requests = Router::new()
+        .route("/v1/installations/endpoint", post(rotate_endpoint))
         .route(DELIVERY_PATH, post(deliver))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
     let public = Router::new()
         .merge(enrollment)
+        .merge(browser_requests)
         .merge(standard_requests)
         .with_state(state.clone())
         .layer(ConcurrencyLimitLayer::new(256))
@@ -881,6 +944,13 @@ pub fn router_with_metrics(
     }
     (public, health)
 }
+
+mod web;
+use web::{enroll_web, rotate_web_endpoint, webpush_key};
+
+#[cfg(test)]
+#[path = "http_web_tests.rs"]
+mod web_tests;
 
 #[cfg(test)]
 mod request_limit_tests {
@@ -931,6 +1001,7 @@ mod request_limit_tests {
             endpoint_quota_max_deliveries: 10,
             now: fixed_now,
             accepting: Arc::new(AtomicBool::new(true)),
+            cors_origins: Vec::new(),
         }
     }
 
@@ -969,46 +1040,24 @@ mod request_limit_tests {
     }
 
     #[tokio::test]
-    async fn app_attest_routes_without_apns_answer_transport_unavailable() {
+    async fn app_attest_enrollment_without_apns_answers_transport_unavailable() {
         let mut state = state();
         state.application = None;
-        let delegation = serde_json::to_vec(&DelegationRequest {
-            v: WIRE_VERSION,
-            challenge_id: uuid::Uuid::nil(),
-            challenge: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0; 32]),
-            installation_handle: uuid::Uuid::nil(),
-            endpoint_epoch: 1,
-            generation: 1,
-            relay_pubkey: "11".repeat(32),
-            not_before: fixed_now(),
-            expires_at: fixed_now() + 60,
-            assertion: STANDARD.encode([0; 8]),
-        })
-        .unwrap();
-        for (path, body) in [
-            ("/v1/installations", maximum_enrollment_body()),
-            ("/v1/delegations", delegation),
-        ] {
-            let (public, _) = router(state.clone());
-            let response = public
-                .oneshot(
-                    Request::post(path)
-                        .header("content-type", "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-            let bytes = axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .unwrap();
-            assert_eq!(
-                &bytes[..],
-                br#"{"error":"transport_unavailable"}"#,
-                "{path}"
-            );
-        }
+        let (public, _) = router(state);
+        let response = public
+            .oneshot(
+                Request::post("/v1/installations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(maximum_enrollment_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], br#"{"error":"transport_unavailable"}"#);
     }
 
     #[tokio::test]
