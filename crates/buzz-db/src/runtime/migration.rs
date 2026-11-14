@@ -902,7 +902,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 88);
+        assert_eq!(migrations.len(), 90);
         assert!(migrations[83]
             .sql
             .as_str()
@@ -923,6 +923,14 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("VALIDATE CONSTRAINT workflow_runs_cause_pubkey_check"));
+        assert!(migrations[88]
+            .sql
+            .as_str()
+            .contains("ADD COLUMN transport TEXT NOT NULL DEFAULT 'apns'"));
+        assert!(migrations[89]
+            .sql
+            .as_str()
+            .contains("VALIDATE CONSTRAINT push_gateway_installations_transport_check"));
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
         }
@@ -3066,6 +3074,7 @@ mod postgres_tests {
             "entity_deletion_stage_history",
             "user_deletion_fences",
             "workflow_runs",
+            "push_gateway_installations",
         ] {
             assert_eq!(
                 columns(&desired, table).await,
@@ -3082,6 +3091,13 @@ mod postgres_tests {
                  migration and schema.sql must both use a representable shape."
             );
         }
+        // The installation transport check (0089, validated by 0090) is a
+        // named constraint in the desired state too.
+        assert_eq!(
+            constraints(&desired, "push_gateway_installations").await,
+            constraints(&migrated, "push_gateway_installations").await,
+            "constraint parity mismatch for push_gateway_installations"
+        );
         async fn media_edit_index(pool: &PgPool) -> (String, String, String) {
             sqlx::query_as("SELECT pg_get_indexdef(indexrelid),indoption::text,pg_get_expr(indexprs,indrelid) FROM pg_index WHERE indexrelid='public.idx_events_media_edit_target'::regclass AND indisvalid AND indisready AND indislive")
                 .fetch_one(pool).await.expect("valid media edit index")

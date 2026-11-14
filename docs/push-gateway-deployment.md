@@ -1,6 +1,6 @@
 # Buzz Push Gateway deployment
 
-`buzz-push-gateway` is a standalone APNs last hop. Build it with `Dockerfile.push-gateway`; do not run it in the relay image or give relays APNs credentials.
+`buzz-push-gateway` is a standalone APNs and Web Push last hop. Build it with `Dockerfile.push-gateway`; do not run it in the relay image or give relays APNs credentials.
 
 ## Network and health
 
@@ -15,13 +15,59 @@
 | `DATABASE_URL` | PostgreSQL authority/admission store. Runtime credentials need DML on the six gateway tables, not DDL. |
 | `BUZZ_PUSH_MAX_GRANT_LIFETIME_SECONDS` | Maximum delegation capability lifetime (`1..=31536000`). |
 | `BUZZ_PUSH_MAX_INSTALLATION_LIFETIME_SECONDS` | Maximum encrypted-token installation lifetime (default 90 days, max one year). Clients must renew before expiry. |
+| `BUZZ_PUSH_GRANT_KEYS` | Capability AEAD keyring, `id:base64-32-bytes[,predecessor...]`; current key first. |
+| `BUZZ_PUSH_TOKEN_KEYS` | Independent token-custody AEAD keyring in the same format. Never reuse grant keys. |
+
+At least one transport must be configured: APNs, Web Push, or both. Setting
+any variable of a transport configures it, and then its required variables
+must all be set; startup fails on a partial group.
+
+### APNs
+
+| Variable | Purpose |
+|---|---|
 | `BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH` | Read-only mounted Apple App Attest root certificate PEM. |
 | `BUZZ_PUSH_APP_ATTEST_APP_ID` | Exact server-owned Apple App Attest application identifier (`TEAMID.bundle-id`). |
 | `BUZZ_PUSH_APNS_TOPIC` | Server-owned APNs topic. Never accepted from a client. |
 | `BUZZ_PUSH_APNS_ENVIRONMENT` | `production` or `sandbox`, selected by deployment configuration. |
 | `BUZZ_PUSH_APNS_CERT_PATH` | Read-only certificate/private-key PEM. |
-| `BUZZ_PUSH_GRANT_KEYS` | Capability AEAD keyring, `id:base64-32-bytes[,predecessor...]`; current key first. |
-| `BUZZ_PUSH_TOKEN_KEYS` | Independent token-custody AEAD keyring in the same format. Never reuse grant keys. |
+
+Without APNs, the App Attest routes answer `404 transport_unavailable`.
+
+### Web Push
+
+| Variable | Purpose |
+|---|---|
+| `BUZZ_PUSH_VAPID_KEY_PATH` | Read-only mounted P-256 VAPID private key PEM, PKCS#8 or SEC1. Generate one with `openssl ecparam -name prime256v1 -genkey -noout -out vapid.pem`. Changing it invalidates every browser subscription. |
+| `BUZZ_PUSH_VAPID_SUBJECT` | Contact the push services may use: a `mailto:` or `https:` URL. |
+| `BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS` | Optional. Comma-separated push service hosts, exact or `*.suffix`. Default: `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `web.push.apple.com`, `*.notify.windows.com`. The gateway sends only to `https` endpoints on these hosts, and follows no redirects. |
+
+The gateway encrypts one fixed payload to each browser (RFC 8291) and signs
+each request with VAPID (RFC 8292). Push services answering 404 or 410
+invalidate the endpoint; 401 and 403 are configuration faults and never do.
+
+- **Rotating the VAPID key** strands every browser subscription: push
+  services answer 403 for a subscription made under another key, and the
+  gateway keeps treating that as a configuration fault until the wakes
+  expire. Browsers must compare `GET /v1/webpush/key` with their
+  subscription's `applicationServerKey`, and subscribe again and replace
+  the subscription when they differ.
+- **Narrowing the allowlist** makes every wake to an installation on a
+  removed host a permanent request fault. Nothing invalidates those
+  installations; they stop when they expire or their browser enrolls again.
+- **Upgrading:** run the migration job (gateway migrations 0007 and 0008)
+  before the new gateway serves. Readiness checks the tables, not this
+  column.
+Egress needs HTTPS to the allowed hosts. The Helm chart does not set these
+variables yet.
+
+| Variable | Purpose |
+|---|---|
+| `BUZZ_PUSH_CORS_ORIGINS` | Optional. Comma-separated origins (`https://app.example.org`) whose pages may call the browser routes: challenges, web enrollment and subscription replacement, the VAPID key, delegation and revocation. APNs enrollment and rotation, and relay delivery, never answer CORS. Without it, browsers can't use the gateway. |
+
+Without Web Push, the browser enrollment routes and `GET /v1/webpush/key`
+answer `404 transport_unavailable`. See [Buzz push notes](buzz-push.md) for
+the browser request formats.
 
 Each gateway serves one configured Apple application. App Attest validates
 `application.appAttestAppId` (`TEAMID.bundle-id`) before enrollment. APNs uses

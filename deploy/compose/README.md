@@ -41,7 +41,10 @@ keypair.
 - Mobile push remains off by default. To use the public gateway, keep the
   template's explicit `BUZZ_PUSH_GATEWAY_DELIVERY_URL` and set
   `BUZZ_PUSH_ENABLED=true`. To use another gateway, replace the exact HTTPS
-  `/v1/deliveries/apns` URL before enabling push.
+  `/v1/deliveries/apns` URL before enabling push. Set
+  `BUZZ_PUSH_WEBPUSH_ENABLED=true` as well only when that gateway has Web
+  Push configured: the relay then advertises `webpush` in NIP-11
+  `class_support` and accepts browser leases.
 - The bundled Compose stack fixes the relay endpoint to `http://minio:9000` and
   `BUZZ_S3_ADDRESSING_STYLE=path`: Docker DNS resolves `minio`, not
   `<bucket>.minio`. It is not configurable for an external S3 provider through

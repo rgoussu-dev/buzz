@@ -24,9 +24,40 @@ pub struct Challenge {
 pub(crate) const CHALLENGE_QUOTA_WINDOW_SECONDS: i64 = 60;
 pub(crate) const CHALLENGE_QUOTA_MAX_REQUESTS: usize = 600;
 
+/// The push service an installation's endpoint belongs to. It decides how
+/// the installation authenticates (App Attest, or a Web Crypto P-256 key) and
+/// which transport delivers its wakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// An APNs device token, enrolled with App Attest.
+    Apns,
+    /// A Web Push subscription, enrolled with a P-256 key.
+    WebPush,
+}
+
+impl Transport {
+    /// Stored name, as in the `transport` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apns => "apns",
+            Self::WebPush => "webpush",
+        }
+    }
+
+    /// Parse a stored name.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "apns" => Some(Self::Apns),
+            "webpush" => Some(Self::WebPush),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInstallation {
     pub id: Uuid,
+    pub transport: Transport,
     pub app_attest_key_id: Vec<u8>,
     pub app_attest_public_key: Vec<u8>,
     pub assertion_counter: u32,
@@ -39,6 +70,7 @@ pub struct NewInstallation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installation {
     pub id: Uuid,
+    pub transport: Transport,
     pub app_attest_key_id: Vec<u8>,
     pub app_attest_public_key: Vec<u8>,
     pub assertion_counter: u32,
@@ -65,6 +97,7 @@ pub struct Delegation {
 pub struct DeliveryAuthority {
     pub delegation_id: Uuid,
     pub installation_id: Uuid,
+    pub transport: Transport,
     pub relay_pubkey: String,
     pub token_ciphertext: Vec<u8>,
     pub endpoint_epoch: i64,
@@ -311,6 +344,7 @@ impl AuthorityStore for MemoryAuthorityStore {
             n.id,
             Installation {
                 id: n.id,
+                transport: n.transport,
                 app_attest_key_id: n.app_attest_key_id,
                 app_attest_public_key: n.app_attest_public_key,
                 assertion_counter: n.assertion_counter,
@@ -550,6 +584,7 @@ impl AuthorityStore for MemoryAuthorityStore {
         let authority = DeliveryAuthority {
             delegation_id,
             installation_id: i.id,
+            transport: i.transport,
             relay_pubkey: relay.to_owned(),
 
             token_ciphertext: i.token_ciphertext.clone(),
@@ -639,6 +674,7 @@ mod tests {
             .create_installation(
                 NewInstallation {
                     id: Uuid::from_u128(1),
+                    transport: Transport::Apns,
                     app_attest_key_id: vec![1],
                     app_attest_public_key: vec![2; 33],
                     assertion_counter: 0,
@@ -774,6 +810,7 @@ mod tests {
         let store = store().await;
         let replacement = |id| NewInstallation {
             id,
+            transport: Transport::Apns,
             app_attest_key_id: vec![1],
             app_attest_public_key: vec![5; 33],
             assertion_counter: 0,
@@ -940,6 +977,7 @@ mod tests {
             .create_installation(
                 NewInstallation {
                     id: Uuid::from_u128(5),
+                    transport: Transport::Apns,
                     app_attest_key_id: vec![1],
                     app_attest_public_key: vec![5; 33],
                     assertion_counter: 0,

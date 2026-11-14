@@ -20,6 +20,31 @@ async fn migrate_gateway_through(
     GATEWAY_MIGRATOR.run_to(version, pool).await
 }
 
+fn transport(row: &sqlx::postgres::PgRow) -> Result<Transport, AuthorityError> {
+    Transport::parse(row.try_get::<&str, _>("transport").map_err(db)?)
+        .ok_or(AuthorityError::Unavailable)
+}
+
+/// One `push_gateway_installations` row, read with `SELECT *`.
+fn installation_row(r: &sqlx::postgres::PgRow) -> Result<Installation, AuthorityError> {
+    Ok(Installation {
+        id: r.try_get("id").map_err(db)?,
+        transport: transport(r)?,
+        app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
+        app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
+        assertion_counter: u32::try_from(r.try_get::<i64, _>("assertion_counter").map_err(db)?)
+            .map_err(|_| AuthorityError::Unavailable)?,
+        token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
+        token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
+        endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
+        expires_at: ts(r.try_get("expires_at").map_err(db)?),
+        revoked: r
+            .try_get::<Option<DateTime<Utc>>, _>("revoked_at")
+            .map_err(db)?
+            .is_some(),
+    })
+}
+
 #[derive(Clone)]
 pub struct PostgresAuthorityStore {
     pool: PgPool,
@@ -223,8 +248,8 @@ impl AuthorityStore for PostgresAuthorityStore {
                 .await
                 .map_err(db)?;
         }
-        let result = sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
-            .bind(n.id).bind(n.app_attest_key_id).bind(n.app_attest_public_key).bind(i64::from(n.assertion_counter)).bind(n.token_ciphertext).bind(n.token_fingerprint.to_vec()).bind(n.endpoint_epoch).bind(at(n.expires_at)?).execute(&mut *tx).await.map_err(db)?;
+        let result = sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at,transport) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING")
+            .bind(n.id).bind(n.app_attest_key_id).bind(n.app_attest_public_key).bind(i64::from(n.assertion_counter)).bind(n.token_ciphertext).bind(n.token_fingerprint.to_vec()).bind(n.endpoint_epoch).bind(at(n.expires_at)?).bind(n.transport.as_str()).execute(&mut *tx).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Conflict);
         }
@@ -234,19 +259,7 @@ impl AuthorityStore for PostgresAuthorityStore {
     async fn installation(&self, id: Uuid, now: i64) -> Result<Installation, AuthorityError> {
         let r = sqlx::query("SELECT * FROM push_gateway_installations WHERE id=$1 AND revoked_at IS NULL AND expires_at >= $2")
             .bind(id).bind(at(now)?).fetch_optional(&self.pool).await.map_err(db)?.ok_or(AuthorityError::Rejected)?;
-        Ok(Installation {
-            id,
-            app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
-            app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
-            assertion_counter: u32::try_from(r.try_get::<i64, _>("assertion_counter").map_err(db)?)
-                .map_err(|_| AuthorityError::Unavailable)?,
-
-            token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
-            token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
-            endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
-            expires_at: ts(r.try_get("expires_at").map_err(db)?),
-            revoked: false,
-        })
+        installation_row(&r)
     }
     async fn installation_for_revocation(
         &self,
@@ -262,22 +275,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         .await
         .map_err(db)?
         .ok_or(AuthorityError::Rejected)?;
-        Ok(Installation {
-            id,
-            app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
-            app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
-            assertion_counter: u32::try_from(r.try_get::<i64, _>("assertion_counter").map_err(db)?)
-                .map_err(|_| AuthorityError::Unavailable)?,
-
-            token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
-            token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
-            endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
-            expires_at: ts(r.try_get("expires_at").map_err(db)?),
-            revoked: r
-                .try_get::<Option<DateTime<Utc>>, _>("revoked_at")
-                .map_err(db)?
-                .is_some(),
-        })
+        installation_row(&r)
     }
     async fn matching_installation(
         &self,
@@ -297,25 +295,7 @@ impl AuthorityStore for PostgresAuthorityStore {
             .fetch_optional(&self.pool)
             .await
             .map_err(db)?;
-        r.map(|r| {
-            let id = r.try_get("id").map_err(db)?;
-            Ok(Installation {
-                id,
-                app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
-                app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
-                assertion_counter: u32::try_from(
-                    r.try_get::<i64, _>("assertion_counter").map_err(db)?,
-                )
-                .map_err(|_| AuthorityError::Unavailable)?,
-
-                token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
-                token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
-                endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
-                expires_at: ts(r.try_get("expires_at").map_err(db)?),
-                revoked: false,
-            })
-        })
-        .transpose()
+        r.as_ref().map(installation_row).transpose()
     }
     async fn advance_assertion_counter(
         &self,
@@ -431,7 +411,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         // Every authority mutation locks installation before delegation. Keep
         // this order here to avoid delivery-vs-refresh deadlocks.
         let i = sqlx::query(
-            "SELECT token_ciphertext,token_fingerprint,endpoint_epoch,expires_at,revoked_at
+            "SELECT token_ciphertext,token_fingerprint,endpoint_epoch,expires_at,revoked_at,transport
              FROM push_gateway_installations
              WHERE id=(SELECT installation_id FROM push_gateway_delegations WHERE id=$1)
              FOR UPDATE",
@@ -468,6 +448,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         let authority = DeliveryAuthority {
             delegation_id: did,
             installation_id,
+            transport: transport(&i)?,
             relay_pubkey: relay.to_owned(),
 
             token_ciphertext: i.try_get("token_ciphertext").map_err(db)?,
@@ -936,12 +917,119 @@ mod postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL"]
+    async fn installation_transport_round_trips_to_delivery_and_the_column_is_checked() {
+        let (pool, schema) = full_schema(2).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        for (n, transport) in [(1u128, Transport::Apns), (2, Transport::WebPush)] {
+            store
+                .create_installation(
+                    NewInstallation {
+                        id: Uuid::from_u128(n),
+                        transport,
+                        app_attest_key_id: vec![n as u8],
+                        app_attest_public_key: vec![2; 65],
+                        assertion_counter: 0,
+                        token_ciphertext: vec![3],
+                        token_fingerprint: [n as u8; 32],
+                        endpoint_epoch: 1,
+                        expires_at: now + 600,
+                    },
+                    now,
+                )
+                .await
+                .expect("create installation");
+            let installation = store
+                .installation(Uuid::from_u128(n), now)
+                .await
+                .expect("read installation");
+            assert_eq!(installation.transport, transport);
+            assert_eq!(
+                store
+                    .matching_installation(&[n as u8], [n as u8; 32], 1, now + 600, now)
+                    .await
+                    .expect("match installation")
+                    .map(|i| i.transport),
+                Some(transport)
+            );
+            store
+                .upsert_delegation(Delegation {
+                    id: Uuid::from_u128(n + 10),
+                    installation_id: Uuid::from_u128(n),
+                    relay_pubkey: RELAY_HEX.to_owned(),
+                    endpoint_epoch: 1,
+                    generation: 1,
+                    not_before: now,
+                    expires_at: now + 600,
+                    revoked: false,
+                })
+                .await
+                .expect("delegate");
+            let permit = store
+                .authorize_delivery(
+                    Uuid::from_u128(n + 10),
+                    RELAY_HEX,
+                    1,
+                    1,
+                    &format!("{n:064x}"),
+                    Uuid::new_v4(),
+                    now + 60,
+                    60,
+                    10,
+                    now,
+                )
+                .await
+                .expect("admit delivery");
+            assert_eq!(permit.authority.transport, transport);
+        }
+        // Rows written by an older gateway, without the column, are APNs ones.
+        sqlx::query(
+            "INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at)
+             VALUES($1,$2,$3,0,$4,$5,1,now() + interval '1 hour')",
+        )
+        .bind(Uuid::from_u128(3))
+        .bind(vec![3u8])
+        .bind(vec![2u8; 65])
+        .bind(vec![3u8])
+        .bind(vec![3u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert as an older gateway does");
+        assert_eq!(
+            store
+                .installation(Uuid::from_u128(3), now)
+                .await
+                .unwrap()
+                .transport,
+            Transport::Apns
+        );
+        let unknown =
+            sqlx::query("UPDATE push_gateway_installations SET transport='fcm' WHERE id=$1")
+                .bind(Uuid::from_u128(3))
+                .execute(&pool)
+                .await;
+        assert!(unknown.is_err(), "the check refuses unknown transports");
+        let validated: bool = sqlx::query_scalar(
+            "SELECT convalidated FROM pg_constraint WHERE conname='push_gateway_installations_transport_check'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read the check");
+        assert!(validated, "0008 validates the check");
+
+        pool.close().await;
+        drop_schema(&schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
     async fn delegation_renews_and_expired_enrollment_recovers_token_ownership() {
         let (pool, schema) = full_schema(2).await;
         let store = PostgresAuthorityStore::new(pool.clone());
         let now = Utc::now().timestamp();
         let installation = |id, expires_at| NewInstallation {
             id,
+            transport: Transport::Apns,
             app_attest_key_id: vec![1],
             app_attest_public_key: vec![2; 33],
             assertion_counter: 0,
@@ -1008,6 +1096,7 @@ mod postgres_tests {
         let now = Utc::now().timestamp();
         let installation = |id| NewInstallation {
             id,
+            transport: Transport::Apns,
             app_attest_key_id: vec![1],
             app_attest_public_key: vec![2; 33],
             assertion_counter: 0,

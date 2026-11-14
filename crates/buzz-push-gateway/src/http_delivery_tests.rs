@@ -8,7 +8,7 @@ use std::sync::{
 use crate::{
     apns::{DeliveryAttempt, DeliveryOutcome, PushTransport},
     app_attest::AppAttestVerifier,
-    authority::{AuthorityStore, Delegation, MemoryAuthorityStore, NewInstallation},
+    authority::{AuthorityStore, Delegation, MemoryAuthorityStore, NewInstallation, Transport},
     grant::{GrantKey, GrantKeyring},
     http::ApplicationRuntime,
     model::EndpointGrant,
@@ -26,14 +26,14 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries/apns";
+pub(crate) const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries/apns";
 const FORWARDED_URL: &str = "https://push.example/v1/deliveries/apns";
 
 struct TestTransport(Arc<AtomicUsize>);
 #[async_trait::async_trait]
 impl PushTransport for TestTransport {
-    async fn send(&self, _: DeliveryAttempt, endpoint: &str) -> DeliveryOutcome {
-        assert_eq!(endpoint, "01020304");
+    async fn send(&self, _: DeliveryAttempt, endpoint: &[u8]) -> DeliveryOutcome {
+        assert_eq!(endpoint, [1, 2, 3, 4]);
         self.0.fetch_add(1, Ordering::SeqCst);
         DeliveryOutcome::Accepted
     }
@@ -44,6 +44,10 @@ fn now() -> i64 {
 }
 
 async fn fixture() -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
+    fixture_with(true).await
+}
+
+async fn fixture_with(apns: bool) -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
     let keys = Keys::generate();
     let authority = Arc::new(MemoryAuthorityStore::default());
     let token_keyring =
@@ -55,11 +59,12 @@ async fn fixture() -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
         .create_installation(
             NewInstallation {
                 id: installation_id,
+                transport: Transport::Apns,
                 app_attest_key_id: vec![3; 32],
                 app_attest_public_key: vec![4; 65],
                 assertion_counter: 0,
 
-                token_ciphertext: token_keyring.seal(&[1, 2, 3, 4]).unwrap(),
+                token_ciphertext: token_keyring.seal(Transport::Apns, &[1, 2, 3, 4]).unwrap(),
                 token_fingerprint: [5; 32],
                 endpoint_epoch: 1,
                 expires_at: now() + 600,
@@ -98,15 +103,18 @@ async fn fixture() -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
         grant_keyring,
         authority,
         token_keyring,
-        application: Arc::new(ApplicationRuntime {
-            app_attest: Arc::new(
-                AppAttestVerifier::new(
-                    "TEAMID.com.example.buzz".into(),
-                    include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
-                )
-                .unwrap(),
-            ),
-            transport: Arc::new(TestTransport(sends.clone())),
+        webpush: None,
+        application: apns.then(|| {
+            Arc::new(ApplicationRuntime {
+                app_attest: Arc::new(
+                    AppAttestVerifier::new(
+                        "TEAMID.com.example.buzz".into(),
+                        include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
+                    )
+                    .unwrap(),
+                ),
+                transport: Arc::new(TestTransport(sends.clone())),
+            })
         }),
         max_grant_lifetime_seconds: 600,
         max_installation_lifetime_seconds: 600,
@@ -114,6 +122,7 @@ async fn fixture() -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
         endpoint_quota_max_deliveries: 10,
         now,
         accepting: Arc::new(AtomicBool::new(true)),
+        cors_origins: Vec::new(),
     });
     let body = serde_json::to_vec(&serde_json::json!({
         "v": 1, "endpoint_grant": grant, "request_id": Uuid::new_v4(), "expires_at": now() + 60,
@@ -122,7 +131,7 @@ async fn fixture() -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsize>) {
     (app, keys, body, sends)
 }
 
-fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
+pub(crate) fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
     let hash = hex::encode(Sha256::digest(body));
     let event = EventBuilder::new(Kind::HttpAuth, "")
         .tags([
@@ -138,7 +147,12 @@ fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
     )
 }
 
-fn request(url: &str, proto: Option<&str>, auth: String, body: Vec<u8>) -> Request<Body> {
+pub(crate) fn request(
+    url: &str,
+    proto: Option<&str>,
+    auth: String,
+    body: Vec<u8>,
+) -> Request<Body> {
     let url = url::Url::parse(url).unwrap();
     let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
     let path = &url[url::Position::BeforePath..url::Position::AfterQuery];
@@ -367,4 +381,25 @@ async fn grant_signer_and_replay_checks_remain_enforced() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn delivery_without_apns_is_a_configuration_fault_after_authentication() {
+    let (app, keys, body, sends) = fixture_with(false).await;
+    let unsigned = request(DIRECT_URL, None, "Nostr e30=".into(), body.clone());
+    assert_eq!(
+        app.clone().oneshot(unsigned).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let auth = signed_header(&keys, DIRECT_URL, "POST", &body);
+    let response = app
+        .oneshot(request(DIRECT_URL, None, auth, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], br#"{"error":"configuration_fault"}"#);
+    assert_eq!(sends.load(Ordering::SeqCst), 0);
 }
