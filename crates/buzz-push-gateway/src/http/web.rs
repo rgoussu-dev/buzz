@@ -66,15 +66,23 @@ pub(super) async fn enroll_web(State(s): State<AppState>, body: Bytes) -> Respon
     let key_id = key.id();
     let public_key = key.to_sec1();
     let fingerprint = subscription.fingerprint();
+    let Ok(custody) = subscription.to_bytes() else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
     // A replay of a request that already succeeded returns its installation,
     // as for APNs. The key id is a digest of the key, so a match is this
-    // key's installation.
+    // key's installation; it must also hold these subscription keys, or the
+    // gateway would go on encrypting to others.
     match s
         .authority
         .matching_installation(&key_id, fingerprint, r.endpoint_epoch, r.expires_at, now)
         .await
     {
-        Ok(Some(existing)) => {
+        Ok(Some(existing))
+            if s.token_keyring
+                .open(Transport::WebPush, &existing.token_ciphertext)
+                .is_ok_and(|stored| stored == custody) =>
+        {
             return (
                 StatusCode::CREATED,
                 Json(InstallationEnrollResponse {
@@ -85,6 +93,7 @@ pub(super) async fn enroll_web(State(s): State<AppState>, body: Bytes) -> Respon
             )
                 .into_response();
         }
+        Ok(Some(_)) => return installation_conflict(),
         Ok(None) => {}
         Err(e) => return authority_error(e),
     }
@@ -95,11 +104,7 @@ pub(super) async fn enroll_web(State(s): State<AppState>, body: Bytes) -> Respon
     {
         return authority_error(e);
     }
-    let Ok(ciphertext) = subscription
-        .to_bytes()
-        .map_err(|_| ())
-        .and_then(|bytes| s.token_keyring.seal(&bytes).map_err(|_| ()))
-    else {
+    let Ok(ciphertext) = s.token_keyring.seal(Transport::WebPush, &custody) else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     };
     let id = uuid::Uuid::new_v4();
@@ -199,11 +204,11 @@ pub(super) async fn rotate_web_endpoint(State(s): State<AppState>, body: Bytes) 
     if installation.transport != Transport::WebPush {
         return error(StatusCode::NOT_FOUND, "not_authorized");
     }
-    let Ok(ciphertext) = subscription
-        .to_bytes()
-        .map_err(|_| ())
-        .and_then(|bytes| s.token_keyring.seal(&bytes).map_err(|_| ()))
-    else {
+    let Ok(ciphertext) = subscription.to_bytes().map_err(|_| ()).and_then(|bytes| {
+        s.token_keyring
+            .seal(Transport::WebPush, &bytes)
+            .map_err(|_| ())
+    }) else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable");
     };
     match s

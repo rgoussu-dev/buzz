@@ -196,7 +196,10 @@ impl Subscription {
             return Err(WebPushError::Subscription);
         }
         let endpoint = Url::parse(endpoint).map_err(|_| WebPushError::Subscription)?;
-        if !allowlist.allows(&endpoint) {
+        // Parsing percent-encodes, so the stored form can be longer than the
+        // input: bound what is stored.
+        if endpoint.as_str().len() > MAX_SUBSCRIPTION_ENDPOINT_BYTES || !allowlist.allows(&endpoint)
+        {
             return Err(WebPushError::Subscription);
         }
         let p256dh = URL_SAFE_NO_PAD
@@ -769,6 +772,7 @@ mod tests {
         .unwrap();
         let sealed = keyring
             .seal(
+                crate::authority::Transport::WebPush,
                 &Subscription::new(&longest, UA_PUBLIC, AUTH, &list)
                     .unwrap()
                     .to_bytes()
@@ -777,6 +781,13 @@ mod tests {
             .unwrap();
         assert!(sealed.len() <= 2048);
         assert!(Subscription::new(&format!("{longest}a"), UA_PUBLIC, AUTH, &list).is_err());
+        // Short as typed, too long once percent-encoded.
+        let encoded = format!(
+            "{prefix}{}",
+            "é".repeat(MAX_SUBSCRIPTION_ENDPOINT_BYTES / 4)
+        );
+        assert!(encoded.len() <= MAX_SUBSCRIPTION_ENDPOINT_BYTES);
+        assert!(Subscription::new(&encoded, UA_PUBLIC, AUTH, &list).is_err());
         assert_ne!(
             subscription.fingerprint(),
             Subscription::new(

@@ -298,7 +298,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
     {
         return authority_error(e);
     }
-    let ciphertext = match s.token_keyring.seal(&token) {
+    let ciphertext = match s.token_keyring.seal(Transport::Apns, &token) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
     };
@@ -547,7 +547,7 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
     if installation.transport != Transport::Apns {
         return error(StatusCode::NOT_FOUND, "not_authorized");
     }
-    let ciphertext = match s.token_keyring.seal(&token) {
+    let ciphertext = match s.token_keyring.seal(Transport::Apns, &token) {
         Ok(v) => v,
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
     };
@@ -777,7 +777,10 @@ async fn deliver(
             .await;
         return error(StatusCode::SERVICE_UNAVAILABLE, "configuration_fault");
     };
-    let endpoint = match s.token_keyring.open(&permit.authority.token_ciphertext) {
+    let endpoint = match s
+        .token_keyring
+        .open(kind, &permit.authority.token_ciphertext)
+    {
         Ok(token) => token,
         Err(_) => {
             crate::metrics::record_delivery_error("token_custody");

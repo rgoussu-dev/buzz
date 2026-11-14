@@ -45,6 +45,19 @@ Without APNs, the App Attest routes answer `404 transport_unavailable`.
 The gateway encrypts one fixed payload to each browser (RFC 8291) and signs
 each request with VAPID (RFC 8292). Push services answering 404 or 410
 invalidate the endpoint; 401 and 403 are configuration faults and never do.
+
+- **Rotating the VAPID key** strands every browser subscription: push
+  services answer 403 for a subscription made under another key, and the
+  gateway keeps treating that as a configuration fault until the wakes
+  expire. Browsers must compare `GET /v1/webpush/key` with their
+  subscription's `applicationServerKey`, and subscribe again and replace
+  the subscription when they differ.
+- **Narrowing the allowlist** makes every wake to an installation on a
+  removed host a permanent request fault. Nothing invalidates those
+  installations; they stop when they expire or their browser enrolls again.
+- **Upgrading:** run the migration job (gateway migrations 0007 and 0008)
+  before the new gateway serves. Readiness checks the tables, not this
+  column.
 Egress needs HTTPS to the allowed hosts. The Helm chart does not set these
 variables yet.
 

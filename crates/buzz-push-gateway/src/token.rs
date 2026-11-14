@@ -9,7 +9,17 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
-const AAD_PREFIX: &[u8] = b"buzz-apns-token-v1:";
+use crate::authority::Transport;
+
+/// Each transport's custody is bound to it: one can't be opened as the
+/// other. A gateway from before Web Push can't open a browser subscription,
+/// so it never sends one to APNs as a token.
+fn aad_prefix(transport: Transport) -> &'static [u8] {
+    match transport {
+        Transport::Apns => b"buzz-apns-token-v1:",
+        Transport::WebPush => b"buzz-webpush-subscription-v1:",
+    }
+}
 const MAX_KEY_ID_BYTES: usize = 32;
 const MAX_CIPHERTEXT_BYTES: usize = 2048;
 /// Longest endpoint accepted for custody. Sealed, it stays within
@@ -52,8 +62,8 @@ impl TokenKey {
             cipher: Aes256Gcm::new_from_slice(key).map_err(|_| TokenError::Invalid)?,
         })
     }
-    fn aad(&self) -> Vec<u8> {
-        [AAD_PREFIX, self.id.as_bytes()].concat()
+    fn aad(&self, transport: Transport) -> Vec<u8> {
+        [aad_prefix(transport), self.id.as_bytes()].concat()
     }
 }
 
@@ -71,7 +81,8 @@ impl TokenKeyring {
             predecessors: rest.into_iter().map(|k| (k.id.clone(), k)).collect(),
         })
     }
-    pub fn seal(&self, token: &[u8]) -> Result<Vec<u8>, TokenError> {
+    /// Seal `token`, an endpoint of `transport`, with the current key.
+    pub fn seal(&self, transport: Transport, token: &[u8]) -> Result<Vec<u8>, TokenError> {
         if token.is_empty() || token.len() > MAX_CUSTODY_BYTES {
             return Err(TokenError::Invalid);
         }
@@ -85,7 +96,7 @@ impl TokenKeyring {
                     Nonce::from_slice(&nonce),
                     aes_gcm::aead::Payload {
                         msg: token,
-                        aad: &self.current.aad(),
+                        aad: &self.current.aad(transport),
                     },
                 )
                 .map_err(|_| TokenError::Invalid)?,
@@ -97,7 +108,9 @@ impl TokenKeyring {
         }
         Ok(encoded)
     }
-    pub fn open(&self, encoded: &[u8]) -> Result<Vec<u8>, TokenError> {
+    /// Open custody sealed for `transport`; custody of another transport
+    /// fails.
+    pub fn open(&self, transport: Transport, encoded: &[u8]) -> Result<Vec<u8>, TokenError> {
         if encoded.len() > MAX_CIPHERTEXT_BYTES {
             return Err(TokenError::Invalid);
         }
@@ -119,9 +132,36 @@ impl TokenKeyring {
                 Nonce::from_slice(&bytes[..12]),
                 aes_gcm::aead::Payload {
                     msg: &bytes[12..],
-                    aad: &key.aad(),
+                    aad: &key.aad(transport),
                 },
             )
             .map_err(|_| TokenError::Invalid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custody_opens_only_as_the_transport_it_was_sealed_for() {
+        let ring = TokenKeyring::new(vec![TokenKey::new("k", &[5; 32]).unwrap()]).unwrap();
+        for (sealed_as, other) in [
+            (Transport::Apns, Transport::WebPush),
+            (Transport::WebPush, Transport::Apns),
+        ] {
+            let sealed = ring.seal(sealed_as, b"endpoint").unwrap();
+            assert_eq!(ring.open(sealed_as, &sealed).unwrap(), b"endpoint");
+            // A gateway that predates Web Push opens everything as APNs: a
+            // browser subscription must not open for it.
+            assert!(ring.open(other, &sealed).is_err());
+        }
+        assert!(ring
+            .seal(Transport::WebPush, &[1; MAX_CUSTODY_BYTES])
+            .is_ok());
+        assert!(ring
+            .seal(Transport::WebPush, &[1; MAX_CUSTODY_BYTES + 1])
+            .is_err());
+        assert!(ring.seal(Transport::Apns, &[]).is_err());
     }
 }

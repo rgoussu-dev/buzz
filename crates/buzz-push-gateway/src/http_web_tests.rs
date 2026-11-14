@@ -308,6 +308,35 @@ async fn browser_installation_enrolls_delegates_receives_rotates_and_revokes() {
         alice.post("/v1/installations/web", &enroll).await,
         (StatusCode::CREATED, enrolled.clone())
     );
+    // A "replay" carrying other subscription keys is not the same request.
+    let mut rekeyed = alice.enroll_request_with(
+        ENDPOINT,
+        (enroll.challenge_id, enroll.challenge.clone()),
+        enroll.expires_at,
+    );
+    rekeyed.subscription.keys.auth = URL_SAFE_NO_PAD.encode([9; 16]);
+    rekeyed.signature = alice.sign(
+        "buzz.push.enroll-web.v1",
+        &WebEnrollTranscript {
+            v: 1,
+            audience: WEB_ENROLL_AUDIENCE,
+            challenge_id: rekeyed.challenge_id,
+            challenge: &rekeyed.challenge,
+            public_key: &rekeyed.public_key,
+            endpoint: &rekeyed.subscription.endpoint,
+            p256dh: &rekeyed.subscription.keys.p256dh,
+            auth: &rekeyed.subscription.keys.auth,
+            endpoint_epoch: 1,
+            expires_at: rekeyed.expires_at,
+        },
+    );
+    assert_eq!(
+        alice.post("/v1/installations/web", &rekeyed).await,
+        (
+            StatusCode::CONFLICT,
+            serde_json::json!({"error": "installation_conflict"})
+        )
+    );
 
     // Refusals: a challenge already spent, a lifetime over the gateway's
     // limit, a tampered request, an endpoint off the allowlist, and the same

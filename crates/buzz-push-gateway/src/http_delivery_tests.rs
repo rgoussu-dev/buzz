@@ -64,7 +64,7 @@ async fn fixture_with(apns: bool) -> (axum::Router, Keys, Vec<u8>, Arc<AtomicUsi
                 app_attest_public_key: vec![4; 65],
                 assertion_counter: 0,
 
-                token_ciphertext: token_keyring.seal(&[1, 2, 3, 4]).unwrap(),
+                token_ciphertext: token_keyring.seal(Transport::Apns, &[1, 2, 3, 4]).unwrap(),
                 token_fingerprint: [5; 32],
                 endpoint_epoch: 1,
                 expires_at: now() + 600,
