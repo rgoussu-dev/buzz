@@ -15,7 +15,7 @@ CREATE TABLE push_gateway_installations (
     revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    platform TEXT NOT NULL DEFAULT 'ios' CHECK (platform IN ('ios', 'android'))
+    platform TEXT NOT NULL DEFAULT 'ios' CHECK (platform IN ('ios', 'android', 'web'))
 );
 
 CREATE INDEX push_gateway_installations_expiry ON push_gateway_installations (expires_at) WHERE revoked_at IS NULL;

@@ -81,6 +81,21 @@ local. Cache misses, restarts, and evictions only affect performance; object
 storage remains the source of truth, and per-request refs/HEAD are still
 materialized from the current manifest.
 
+Reads support partial fetch. The `upload-pack` advertisement offers `filter`
+and `allow-reachable-sha1-in-want`, from the manifest fast path and from the
+subprocess fallback alike, and every `upload-pack` subprocess runs with
+`uploadpack.allowFilter` and `uploadpack.allowReachableSHA1InWant`. So
+`git clone --filter=blob:none` works, and a client can then fetch the blobs
+it opens by object id. Hydration is unaffected: the server-side repository
+still holds every pack the manifest names, and each such request hydrates it
+and takes a git permit like any other, so clients should batch blob wants.
+`uploadpack.allowAnySHA1InWant` stays off, so a commit that no ref reaches is
+refused. Git checks a wanted commit by ancestry only: a tree or blob that a
+force-push or ref deletion left unreachable but still named by the manifest
+(Theorem 2's remark) is served to a reader who asks for it by object id. That
+was already true of any hand-written request; the read gate and the need to
+know the object id bound it.
+
 The accepted v1 tradeoff: under concurrent same-repo pushes, every contender
 hydrates and runs receive-pack, and the CAS losers' subprocess work is
 discarded. This is wasted CPU/IO under contention, not a correctness bug —

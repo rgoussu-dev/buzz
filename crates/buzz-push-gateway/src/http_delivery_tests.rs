@@ -13,7 +13,7 @@ use crate::{
         Installation, MemoryAuthorityStore, NewInstallation, Platform,
     },
     grant::{GrantKey, GrantKeyring},
-    http::ApplicationRuntime,
+    http::{ApplicationRuntime, IosRuntime},
     model::EndpointGrant,
     router,
     token::{TokenKey, TokenKeyring},
@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries";
+pub(crate) const DIRECT_URL: &str = "http://push.example:8080/v1/deliveries";
 const FORWARDED_URL: &str = "https://push.example/v1/deliveries";
 // The APNs-named alias of the delivery route.
 const APNS_DIRECT_URL: &str = "http://push.example:8080/v1/deliveries/apns";
@@ -117,15 +117,18 @@ async fn fixture_with_store(
         authority,
         token_keyring,
         application: Arc::new(ApplicationRuntime {
-            app_attest: Arc::new(
-                AppAttestVerifier::new(
-                    "TEAMID.com.example.buzz".into(),
-                    include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
-                )
-                .unwrap(),
-            ),
-            transport,
+            ios: Some(IosRuntime {
+                app_attest: Arc::new(
+                    AppAttestVerifier::new(
+                        "TEAMID.com.example.buzz".into(),
+                        include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
+                    )
+                    .unwrap(),
+                ),
+                transport,
+            }),
             android: None,
+            web: None,
         }),
         max_grant_lifetime_seconds: 600,
         max_installation_lifetime_seconds: 600,
@@ -136,6 +139,7 @@ async fn fixture_with_store(
         )),
         now,
         accepting: Arc::new(AtomicBool::new(true)),
+        cors_origins: Vec::new(),
     });
     let body = serde_json::to_vec(&serde_json::json!({
         "v": 1, "endpoint_grant": grant, "request_id": Uuid::new_v4(), "expires_at": now() + 60,
@@ -144,7 +148,7 @@ async fn fixture_with_store(
     (app, keys, body)
 }
 
-fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
+pub(crate) fn signed_header(keys: &Keys, url: &str, method: &str, body: &[u8]) -> String {
     signed_header_at(keys, url, method, body, Timestamp::now())
 }
 
@@ -173,7 +177,12 @@ fn signed_header_at(
     )
 }
 
-fn request(url: &str, proto: Option<&str>, auth: String, body: Vec<u8>) -> Request<Body> {
+pub(crate) fn request(
+    url: &str,
+    proto: Option<&str>,
+    auth: String,
+    body: Vec<u8>,
+) -> Request<Body> {
     let url = url::Url::parse(url).unwrap();
     let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
     let path = &url[url::Position::BeforePath..url::Position::AfterQuery];

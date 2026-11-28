@@ -59,3 +59,49 @@ losing community membership or their allowlist entry when the relay requires
 one. Private channels, unlisted channels, DMs and system channels still require
 membership. Anyone in the community can already read a listed channel with
 `REQ`, so the exception wakes no one for content they cannot read.
+
+## Web Push installations
+
+A relay started with `BUZZ_PUSH_WEBPUSH_ENABLED=true` (which requires
+`BUZZ_PUSH_ENABLED=true`) adds `"webpush": ["default"]` to `class_support`
+and accepts leases with `"transport": "webpush"`. It is a compatible
+addition: `buzz-push-v1` is unchanged, and clients that know only `apns`
+keep working. Set it only when the relay's gateway has Web Push configured.
+
+A gateway with Web Push configured also enrolls browsers. They follow the
+same installation, delegation and lease model as the apps, with two
+differences: the endpoint is a Web Push subscription, and a non-extractable
+Web Crypto ECDSA P-256 key stands in for the attested key. The gateway records
+such an installation with the platform `web`.
+
+- `GET /v1/webpush/key` returns `{"public_key": "<base64url>"}`, the VAPID
+  key to pass as `applicationServerKey`.
+- `POST /v1/installations/web` enrolls:
+  `{v, challenge_id, challenge, public_key, subscription: {endpoint, keys: {p256dh, auth}}, endpoint_epoch: 1, expires_at, signature}`.
+  `public_key` is the installation key's raw (uncompressed) export,
+  base64url. The response is the same as for `POST /v1/installations`.
+- `POST /v1/installations/web/endpoint` replaces the subscription after
+  `pushsubscriptionchange`:
+  `{v, challenge_id, challenge, installation_handle, endpoint_epoch, new_endpoint_epoch, subscription, signature}`.
+- `POST /v1/delegations`, `/v1/delegations/revoke` and
+  `/v1/installations/revoke` take the same bodies as for the apps; `assertion`
+  is the installation key's signature.
+
+Each signature is Web Crypto's `ECDSA`/`SHA-256` output (raw `r || s`),
+base64url, over `<domain>\n<JSON>`. The JSON object has exactly these keys,
+in this order, and no whitespace (`JSON.stringify` of an object literal
+written in this order):
+
+| Request | Domain | JSON keys |
+|---|---|---|
+| Enroll | `buzz.push.enroll-web.v1` | `v`, `audience` (`https://push.buzz.xyz/v1/installations/web`), `challenge_id`, `challenge`, `public_key`, `endpoint`, `p256dh`, `auth`, `endpoint_epoch`, `expires_at` |
+| Replace subscription | `buzz.push.rotate-endpoint-web.v1` | `v`, `audience` (`https://push.buzz.xyz/v1/installations/web/endpoint`), `challenge_id`, `challenge`, `installation_handle`, `endpoint_epoch`, `new_endpoint_epoch`, `endpoint`, `p256dh`, `auth` |
+| Delegate | `buzz.push.delegate.v1` | `v`, `audience` (`https://push.buzz.xyz/v1/delegations`), `challenge_id`, `challenge`, `installation_handle`, `endpoint_epoch`, `generation`, `relay_pubkey`, `not_before`, `expires_at` |
+| Revoke delegation | `buzz.push.revoke-delegation.v1` | `v`, `audience` (`https://push.buzz.xyz/v1/delegations/revoke`), `challenge_id`, `challenge`, `installation_handle`, `relay_pubkey`, `generation` |
+| Revoke installation | `buzz.push.revoke-installation.v1` | `v`, `audience` (`https://push.buzz.xyz/v1/installations/revoke`), `challenge_id`, `challenge`, `installation_handle`, `endpoint_epoch`, `new_endpoint_epoch` |
+
+Every request takes a fresh challenge from
+`POST /v1/installations/challenges`; it is the replay fence, as a browser
+key has no counter. The wake a browser receives is the fixed payload
+`{"v":1}`, encrypted to its subscription (RFC 8291). Browser routes answer
+CORS for `BUZZ_PUSH_CORS_ORIGINS`.

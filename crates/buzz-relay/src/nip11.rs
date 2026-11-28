@@ -350,6 +350,7 @@ pub async fn relay_info_handler(
 
 fn push_descriptor(
     push_configured: bool,
+    webpush_enabled: bool,
     relay_url: &str,
     executor_key_id: &str,
     relay_keypair: &nostr::Keys,
@@ -371,7 +372,10 @@ fn push_descriptor(
         }],
         "push_kinds": crate::handlers::push_lease::PUSH_KINDS,
         "h_grammar": "uuid-v4-lowercase",
-        "class_support": {"apns": ["default"]},
+        "class_support": crate::handlers::push_lease::supported_transports(webpush_enabled)
+            .iter()
+            .map(|transport| (transport.to_string(), serde_json::json!(["default"])))
+            .collect::<serde_json::Map<_, _>>(),
         "limitation": {
             "max_lease_ttl": 2592000,
             "max_leases_per_pubkey": 16,
@@ -531,6 +535,7 @@ pub(crate) async fn nip11_document(
     };
     if let Some(push) = push_descriptor(
         state.config.push_enabled,
+        state.config.push_webpush_enabled,
         &state.config.relay_url,
         &state.config.push_executor_key_id,
         &state.relay_keypair,
@@ -692,12 +697,42 @@ mod tests {
     #[test]
     fn push_descriptor_is_gated_by_gateway_configuration_and_tenant_binding() {
         let keys = nostr::Keys::generate();
-        assert!(
-            push_descriptor(false, "ws://relay", "key", &keys, Some("tenant.example")).is_none()
+        assert!(push_descriptor(
+            false,
+            false,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example")
+        )
+        .is_none());
+        assert!(push_descriptor(true, false, "ws://relay", "key", &keys, None).is_none());
+        let descriptor = push_descriptor(
+            true,
+            false,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+        )
+        .expect("configured push descriptor");
+        assert_eq!(
+            descriptor["class_support"],
+            serde_json::json!({"apns": ["default"]})
         );
-        assert!(push_descriptor(true, "ws://relay", "key", &keys, None).is_none());
-        let descriptor = push_descriptor(true, "ws://relay", "key", &keys, Some("tenant.example"))
-            .expect("configured push descriptor");
+        let with_webpush = push_descriptor(
+            true,
+            true,
+            "ws://relay",
+            "key",
+            &keys,
+            Some("tenant.example"),
+        )
+        .expect("configured push descriptor");
+        assert_eq!(
+            with_webpush["class_support"],
+            serde_json::json!({"apns": ["default"], "webpush": ["default"]})
+        );
         assert_eq!(descriptor["origin"], "ws://tenant.example");
         assert_eq!(
             descriptor["push_kinds"],

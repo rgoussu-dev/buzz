@@ -12,6 +12,8 @@ pub enum ApnsEnvironment {
 #[derive(Debug, Clone)]
 pub struct ApplicationConfig {
     pub app_attest_app_id: String,
+    /// Read-only mounted Apple App Attest root certificate PEM.
+    pub app_attest_root_cert_path: PathBuf,
     /// Exact Apple attestation environment accepted for enrollment.
     pub app_attest_environment: AppAttestEnvironment,
     pub apns_cert_path: PathBuf,
@@ -44,6 +46,19 @@ pub struct AndroidConfig {
     pub revocation_grace_seconds: i64,
 }
 
+/// The gateway's Web Push identity and the push services it sends to. The
+/// VAPID key and subject are supplied together or not at all; without them
+/// the gateway accepts no browser enrollment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebPushConfig {
+    /// Read-only mounted P-256 VAPID private key PEM (PKCS#8 or SEC1).
+    pub vapid_key_path: PathBuf,
+    /// VAPID contact, a `mailto:` or `https:` URL.
+    pub vapid_subject: String,
+    /// Push service hosts: exact names or `*.suffix` patterns.
+    pub allowed_hosts: Vec<String>,
+}
+
 /// Apple App Attest environment, independent of the APNs transport environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAttestEnvironment {
@@ -72,12 +87,17 @@ pub struct Config {
     pub signed_call_window_seconds: i64,
     /// Signed installation calls one attested key may make per window.
     pub signed_call_max_calls: i64,
-    /// Server-owned application identity and APNs transport.
-    pub application: ApplicationConfig,
+    /// Server-owned Apple application identity and APNs transport, when this
+    /// gateway serves iOS. At least one platform is configured.
+    pub application: Option<ApplicationConfig>,
     /// Android identity and FCM credentials, when this gateway serves Android.
     pub android: Option<AndroidConfig>,
+    /// Web Push identity, when this gateway serves browsers.
+    pub webpush: Option<WebPushConfig>,
+    /// Origins allowed to call the browser routes, as serialized origins
+    /// (`https://app.example.org`). Empty: no CORS.
+    pub cors_origins: Vec<String>,
     pub database_url: String,
-    pub app_attest_root_cert_path: PathBuf,
     /// Ordered current key first, followed by decrypt-only predecessors.
     pub grant_keys: Vec<KeyConfig>,
     /// Independent token-custody keyring. These keys MUST NOT be reused for
@@ -96,9 +116,16 @@ pub const ROTATE_ENDPOINT_AUDIENCE: &str = "https://push.buzz.xyz/v1/installatio
 pub const REVOKE_DELEGATION_AUDIENCE: &str = "https://push.buzz.xyz/v1/delegations/revoke";
 /// Fixed NIP-PL v1 App Attest audience for revoking an installation.
 pub const REVOKE_INSTALLATION_AUDIENCE: &str = "https://push.buzz.xyz/v1/installations/revoke";
+/// Fixed audience for browser installation enrollment.
+pub const WEB_ENROLL_AUDIENCE: &str = "https://push.buzz.xyz/v1/installations/web";
+/// Fixed audience for replacing a browser installation's subscription.
+pub const WEB_ROTATE_ENDPOINT_AUDIENCE: &str =
+    "https://push.buzz.xyz/v1/installations/web/endpoint";
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("no push platform configured: set the APNs, Android or Web Push variables")]
+    NoPlatform,
     #[error("missing required environment variable {0}")]
     Missing(&'static str),
     #[error("invalid environment variable {0}")]
@@ -138,7 +165,84 @@ fn parse_keyring(
     Ok(keys)
 }
 
-fn parse_application(e: &HashMap<String, String>) -> Result<ApplicationConfig, ConfigError> {
+/// Every variable of the Apple application. Setting any of them configures
+/// iOS, and then the required ones must all be set.
+const APPLICATION_SETTINGS: [&str; 6] = [
+    "BUZZ_PUSH_APP_ATTEST_APP_ID",
+    "BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH",
+    "BUZZ_PUSH_APP_ATTEST_ENVIRONMENT",
+    "BUZZ_PUSH_APNS_CERT_PATH",
+    "BUZZ_PUSH_APNS_TOPIC",
+    "BUZZ_PUSH_APNS_ENVIRONMENT",
+];
+
+/// Every Web Push variable, as for [`APPLICATION_SETTINGS`].
+const WEBPUSH_SETTINGS: [&str; 3] = [
+    "BUZZ_PUSH_VAPID_KEY_PATH",
+    "BUZZ_PUSH_VAPID_SUBJECT",
+    "BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS",
+];
+
+fn parse_cors_origins(e: &HashMap<String, String>) -> Result<Vec<String>, ConfigError> {
+    const KEY: &str = "BUZZ_PUSH_CORS_ORIGINS";
+    let Some(value) = e.get(KEY) else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(|origin| {
+            let origin = origin.trim();
+            // Only a bare origin: what a browser sends in `Origin`.
+            url::Url::parse(origin)
+                .ok()
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .map(|url| url.origin().ascii_serialization())
+                .filter(|serialized| serialized == origin)
+                .ok_or(ConfigError::Invalid(KEY))
+        })
+        .collect()
+}
+
+fn parse_webpush(e: &HashMap<String, String>) -> Result<Option<WebPushConfig>, ConfigError> {
+    // A partial configuration is a mistake, not a request to disable Web Push.
+    if WEBPUSH_SETTINGS.iter().all(|key| !e.contains_key(*key)) {
+        return Ok(None);
+    }
+    let required = |key: &'static str| {
+        e.get(key)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or(ConfigError::Missing(key))
+    };
+    let vapid_key_path = PathBuf::from(required(WEBPUSH_SETTINGS[0])?);
+    let vapid_subject = required(WEBPUSH_SETTINGS[1])?.to_owned();
+    let hosts_key = WEBPUSH_SETTINGS[2];
+    let allowed_hosts: Vec<String> = match e.get(hosts_key) {
+        None => crate::webpush::DEFAULT_PUSH_SERVICE_HOSTS
+            .iter()
+            .map(|host| (*host).to_owned())
+            .collect(),
+        Some(value) => value
+            .split(',')
+            .map(|host| host.trim().to_owned())
+            .collect(),
+    };
+    crate::webpush::PushServiceAllowlist::new(allowed_hosts.iter().map(String::as_str))
+        .map_err(|_| ConfigError::Invalid(hosts_key))?;
+    Ok(Some(WebPushConfig {
+        vapid_key_path,
+        vapid_subject,
+        allowed_hosts,
+    }))
+}
+
+fn parse_application(
+    e: &HashMap<String, String>,
+) -> Result<Option<ApplicationConfig>, ConfigError> {
+    // A partial configuration is a mistake, not a request to disable iOS.
+    if APPLICATION_SETTINGS.iter().all(|key| !e.contains_key(*key)) {
+        return Ok(None);
+    }
     let app_id_key = "BUZZ_PUSH_APP_ATTEST_APP_ID";
     let cert_key = "BUZZ_PUSH_APNS_CERT_PATH";
     let topic_key = "BUZZ_PUSH_APNS_TOPIC";
@@ -150,6 +254,7 @@ fn parse_application(e: &HashMap<String, String>) -> Result<ApplicationConfig, C
             .ok_or(ConfigError::Missing(key))
     };
     let app_attest_app_id = required(app_id_key)?.to_owned();
+    let app_attest_root_cert_path = PathBuf::from(required("BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH")?);
     let app_attest_environment = match e
         .get("BUZZ_PUSH_APP_ATTEST_ENVIRONMENT")
         .map(String::as_str)
@@ -166,13 +271,14 @@ fn parse_application(e: &HashMap<String, String>) -> Result<ApplicationConfig, C
         Some("sandbox") => ApnsEnvironment::Sandbox,
         Some(_) => return Err(ConfigError::Invalid(environment_key)),
     };
-    Ok(ApplicationConfig {
+    Ok(Some(ApplicationConfig {
         app_attest_app_id,
+        app_attest_root_cert_path,
         app_attest_environment,
         apns_cert_path,
         apns_topic,
         apns_environment,
-    })
+    }))
 }
 
 const ANDROID_SETTINGS: [&str; 4] = [
@@ -326,6 +432,11 @@ impl Config {
             bounded_positive("BUZZ_PUSH_SIGNED_CALL_MAX_CALLS", 30, 10_000)?;
         let application = parse_application(e)?;
         let android = parse_android(e)?;
+        let webpush = parse_webpush(e)?;
+        if application.is_none() && android.is_none() && webpush.is_none() {
+            return Err(ConfigError::NoPlatform);
+        }
+        let cors_origins = parse_cors_origins(e)?;
         let bind_addr = e
             .get("BUZZ_PUSH_BIND_ADDR")
             .map(String::as_str)
@@ -349,8 +460,9 @@ impl Config {
             signed_call_max_calls,
             application,
             android,
+            webpush,
+            cors_origins,
             database_url: req(e, "DATABASE_URL")?.to_owned(),
-            app_attest_root_cert_path: req(e, "BUZZ_PUSH_APP_ATTEST_ROOT_CERT_PATH")?.into(),
             grant_keys,
             token_keys,
         })
@@ -367,6 +479,7 @@ mod tests {
             Config::from_map(&env)
                 .unwrap()
                 .application
+                .unwrap()
                 .app_attest_environment,
             AppAttestEnvironment::Production
         );
@@ -382,6 +495,7 @@ mod tests {
             Config::from_map(&env)
                 .unwrap()
                 .application
+                .unwrap()
                 .app_attest_environment,
             AppAttestEnvironment::Production
         );
@@ -394,6 +508,7 @@ mod tests {
             Config::from_map(&env)
                 .unwrap()
                 .application
+                .unwrap()
                 .app_attest_environment,
             AppAttestEnvironment::Development
         );
@@ -450,10 +565,13 @@ mod tests {
     fn application_requires_server_owned_identity_and_certificate() {
         let config = Config::from_map(&base()).unwrap();
         assert_eq!(
-            config.application.apns_cert_path,
+            config.application.as_ref().unwrap().apns_cert_path,
             PathBuf::from("/apns-identity.pem")
         );
-        assert_eq!(config.application.apns_topic, "com.example.buzz");
+        assert_eq!(
+            config.application.as_ref().unwrap().apns_topic,
+            "com.example.buzz"
+        );
 
         for variable in [
             "BUZZ_PUSH_APNS_CERT_PATH",
@@ -555,6 +673,120 @@ mod tests {
             ),
         ]);
         env
+    }
+
+    fn without_application(mut env: HashMap<String, String>) -> HashMap<String, String> {
+        for key in APPLICATION_SETTINGS {
+            env.remove(key);
+        }
+        env
+    }
+
+    fn with_webpush(mut env: HashMap<String, String>) -> HashMap<String, String> {
+        env.insert("BUZZ_PUSH_VAPID_KEY_PATH".into(), "/vapid.pem".into());
+        env.insert(
+            "BUZZ_PUSH_VAPID_SUBJECT".into(),
+            "mailto:push@example.org".into(),
+        );
+        env
+    }
+
+    #[test]
+    fn each_platform_is_optional_but_one_is_required() {
+        assert!(matches!(
+            Config::from_map(&without_application(base())),
+            Err(ConfigError::NoPlatform)
+        ));
+
+        let web_only = Config::from_map(&with_webpush(without_application(base()))).unwrap();
+        assert!(web_only.application.is_none() && web_only.android.is_none());
+        let webpush = web_only.webpush.unwrap();
+        assert_eq!(webpush.vapid_key_path, PathBuf::from("/vapid.pem"));
+        assert_eq!(webpush.vapid_subject, "mailto:push@example.org");
+        assert_eq!(
+            webpush.allowed_hosts,
+            crate::webpush::DEFAULT_PUSH_SERVICE_HOSTS
+        );
+
+        let both = Config::from_map(&with_webpush(base())).unwrap();
+        assert!(both.application.is_some() && both.webpush.is_some());
+        assert!(Config::from_map(&base()).unwrap().webpush.is_none());
+
+        // A partial group is a mistake, not a platform turned off.
+        for variable in ["BUZZ_PUSH_VAPID_KEY_PATH", "BUZZ_PUSH_VAPID_SUBJECT"] {
+            let mut env = with_webpush(without_application(base()));
+            env.remove(variable);
+            assert!(
+                matches!(Config::from_map(&env), Err(ConfigError::Missing(key)) if key == variable),
+                "{variable}"
+            );
+        }
+        let mut env = with_webpush(without_application(base()));
+        env.insert("BUZZ_PUSH_APNS_ENVIRONMENT".into(), "sandbox".into());
+        assert!(matches!(
+            Config::from_map(&env),
+            Err(ConfigError::Missing("BUZZ_PUSH_APP_ATTEST_APP_ID"))
+        ));
+    }
+
+    #[test]
+    fn webpush_allowlist_is_configurable_and_checked() {
+        let mut env = with_webpush(without_application(base()));
+        env.insert(
+            "BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS".into(),
+            "push.example.org, *.push.example.net".into(),
+        );
+        assert_eq!(
+            Config::from_map(&env)
+                .unwrap()
+                .webpush
+                .unwrap()
+                .allowed_hosts,
+            vec!["push.example.org", "*.push.example.net"]
+        );
+        for value in ["", "push.example.org,", "*", "localhost"] {
+            env.insert("BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS".into(), value.into());
+            assert!(
+                matches!(
+                    Config::from_map(&env),
+                    Err(ConfigError::Invalid("BUZZ_PUSH_WEBPUSH_ALLOWED_HOSTS"))
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cors_origins_are_bare_origins() {
+        assert!(Config::from_map(&base()).unwrap().cors_origins.is_empty());
+        let mut env = base();
+        env.insert(
+            "BUZZ_PUSH_CORS_ORIGINS".into(),
+            "https://app.example.org, http://localhost:5173".into(),
+        );
+        assert_eq!(
+            Config::from_map(&env).unwrap().cors_origins,
+            vec!["https://app.example.org", "http://localhost:5173"]
+        );
+        for value in [
+            "",
+            "*",
+            "app.example.org",
+            "https://app.example.org/",
+            "https://app.example.org/path",
+            "https://user@app.example.org",
+            "ftp://app.example.org",
+            "https://app.example.org,",
+        ] {
+            env.insert("BUZZ_PUSH_CORS_ORIGINS".into(), value.into());
+            assert!(
+                matches!(
+                    Config::from_map(&env),
+                    Err(ConfigError::Invalid("BUZZ_PUSH_CORS_ORIGINS"))
+                ),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]

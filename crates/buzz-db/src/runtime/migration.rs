@@ -1051,9 +1051,33 @@ mod postgres_tests {
             .collect()
     }
 
+    /// Fork migrations (rgoussu-dev/buzz) are numbered from here, apart from
+    /// upstream's sequence, so an upstream migration never takes their number.
+    const FORK_MIGRATIONS_START: i64 = 9001;
+
+    #[test]
+    fn fork_migrations_follow_upstreams_and_widen_the_platform_check() {
+        let fork: Vec<_> = MIGRATOR
+            .iter()
+            .filter(|migration| migration.version >= FORK_MIGRATIONS_START)
+            .collect();
+        assert_eq!(
+            fork.iter().map(|m| m.version).collect::<Vec<_>>(),
+            [9001, 9002]
+        );
+        assert!(strip_sql_comments(fork[0].sql.as_str())
+            .contains("CHECK (platform IN ('ios', 'android', 'web')) NOT VALID;"));
+        assert!(strip_sql_comments(fork[1].sql.as_str())
+            .contains("VALIDATE CONSTRAINT push_gateway_installations_platform_check;"));
+    }
+
     #[test]
     fn embedded_migrator_contains_consolidated_initial_schema() {
-        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        // Upstream's sequence only: the fork's own migrations are checked above.
+        let mut migrations: Vec<_> = MIGRATOR
+            .iter()
+            .filter(|migration| migration.version < FORK_MIGRATIONS_START)
+            .collect();
         migrations.sort_by_key(|migration| migration.version);
 
         assert_eq!(migrations.len(), 106);

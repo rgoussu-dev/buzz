@@ -680,6 +680,56 @@ pub(crate) fn harden_git_env(cmd: &mut Command) {
         .env("HOME", "/dev/null");
 }
 
+/// `git -c` settings every `upload-pack` subprocess runs with. They enable
+/// partial fetch, and each has a capability in
+/// [`UPLOAD_PACK_PARTIAL_FETCH_CAPS`] that the manifest fast path must offer
+/// too, because a client only uses what the advertisement names.
+///
+/// - `uploadpack.allowFilter` — honor `filter` lines (`blob:none`,
+///   `tree:0`, …), so a client can fetch commits and trees without blobs.
+/// - `uploadpack.allowReachableSHA1InWant` — tell clients they may `want` an
+///   object that is not a ref tip, such as a blob named by a tree they
+///   already hold. Git checks such wants for reachability from the refs; a
+///   commit that is not reachable is refused with `not our ref`.
+///
+/// `uploadpack.allowAnySHA1InWant` is deliberately absent: it would skip that
+/// check and serve commits a force-push or branch deletion left behind in the
+/// packs.
+///
+/// Git's check is by commit ancestry only (`rev-list` without `--objects`,
+/// observed with git 2.43): a wanted tree or blob is served when it is in the
+/// repository's packs, whether or not a ref reaches it. `--stateless-rpc`
+/// upload-pack does the same without this setting, so the setting exposes
+/// nothing a hand-written request could not already fetch. Access stays bounded by the read gate (`authorize_git_read`)
+/// and by the requester having to know the object id.
+const UPLOAD_PACK_GIT_CONFIG: [&str; 2] = [
+    "uploadpack.allowFilter=true",
+    "uploadpack.allowReachableSHA1InWant=true",
+];
+
+/// The capabilities [`UPLOAD_PACK_GIT_CONFIG`] makes `git upload-pack`
+/// advertise, in git's own spelling, for the manifest fast path.
+const UPLOAD_PACK_PARTIAL_FETCH_CAPS: [&str; 2] = ["allow-reachable-sha1-in-want", "filter"];
+
+/// Start a hardened `git <subcmd> --stateless-rpc` command line for a smart
+/// HTTP read: the ref advertisement or the pack negotiation. The caller adds
+/// the remaining arguments, the repository path and the stdio.
+///
+/// `upload-pack` gets [`UPLOAD_PACK_GIT_CONFIG`] here, the one place, so the
+/// advertisement and the request that follows it cannot disagree about
+/// partial fetch. `receive-pack` gets no extra configuration.
+fn git_service_command(git_subcmd: &str) -> Command {
+    let mut cmd = Command::new("git");
+    if git_subcmd == "upload-pack" {
+        for setting in UPLOAD_PACK_GIT_CONFIG {
+            cmd.arg("-c").arg(setting);
+        }
+    }
+    cmd.arg(git_subcmd).arg("--stateless-rpc");
+    harden_git_env(&mut cmd);
+    cmd
+}
+
 /// Acquire the global git-subprocess semaphore permit, or respond 503.
 ///
 /// Bounds total in-flight git subprocesses across all routes. Returned
@@ -952,13 +1002,15 @@ fn pkt_line(out: &mut Vec<u8>, payload: &[u8]) {
 /// ```text
 /// <pkt># service=git-upload-pack\n
 /// 0000
-/// <pkt><head-oid> HEAD\0<caps> symref=HEAD:<head-ref> object-format=<fmt> agent=buzz-git\n
+/// <pkt><head-oid> HEAD\0<caps> symref=HEAD:<head-ref> filter object-format=<fmt> agent=buzz-git\n
 /// <pkt><oid> <refname>\n        # each ref, sorted ascending (BTreeMap order)
 /// 0000
 /// ```
 /// The advertised capabilities are a fixed conservative **offer**; the client
 /// re-negotiates against the real `upload-pack` subprocess in its follow-up
-/// POST, so any subset the real upload-pack supports is safe. `object-format`
+/// POST, so any subset the real upload-pack supports is safe. That includes
+/// partial fetch ([`UPLOAD_PACK_PARTIAL_FETCH_CAPS`]), which the subprocess
+/// honors because [`git_service_command`] configures it. `object-format`
 /// is derived from the oid width (40 hex = sha1, 64 = sha256) rather than
 /// hardcoded. Caller guarantees [`fast_path_eligible`] returned true.
 fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<u8> {
@@ -972,11 +1024,13 @@ fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<
 
     // Capability offer. Conservative, version-agnostic. The symref tells the
     // client which branch HEAD tracks (so `git clone` checks it out).
+    // The partial-fetch capabilities sit where git puts them.
+    let [reachable_want, filter] = UPLOAD_PACK_PARTIAL_FETCH_CAPS;
     let caps = format!(
         "multi_ack thin-pack side-band side-band-64k ofs-delta shallow \
          deepen-since deepen-not deepen-relative no-progress include-tag \
-         multi_ack_detailed no-done symref=HEAD:{head} object-format={fmt} \
-         agent=buzz-git",
+         multi_ack_detailed {reachable_want} no-done symref=HEAD:{head} \
+         {filter} object-format={fmt} agent=buzz-git",
         head = manifest.head,
         fmt = object_format,
     );
@@ -1147,15 +1201,12 @@ async fn info_refs_subprocess(
         (StatusCode::INTERNAL_SERVER_ERROR, "git error").into_response()
     })?;
 
-    let mut cmd = Command::new("git");
-    cmd.arg(git_subcmd)
-        .arg("--stateless-rpc")
-        .arg("--advertise-refs")
+    let mut cmd = git_service_command(git_subcmd);
+    cmd.arg("--advertise-refs")
         .arg(repo.path())
         .stdout(std::process::Stdio::from(stdout_file))
         .stderr(std::process::Stdio::from(stderr_file))
         .kill_on_drop(true);
-    harden_git_env(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
         error!(error = %e, "git subprocess failed to spawn");
@@ -1841,8 +1892,7 @@ fn stream_git_read(
     prefix: Vec<u8>,
     content_type: String,
 ) -> Result<Response, Response> {
-    let mut cmd = Command::new("git");
-    cmd.arg(service).arg("--stateless-rpc");
+    let mut cmd = git_service_command(service);
     for a in extra_args {
         cmd.arg(a);
     }
@@ -1851,7 +1901,6 @@ fn stream_git_read(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    harden_git_env(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
         error!(error = %e, service = %service, "git subprocess failed to spawn");
@@ -3824,6 +3873,12 @@ mod track_c_tests {
         assert!(caps.contains("symref=HEAD:refs/heads/main"));
         assert!(caps.contains("object-format=sha1"));
         assert!(caps.contains("side-band-64k"));
+        // Partial fetch is offered as whole capability tokens.
+        let offered: Vec<&str> = caps.split(' ').collect();
+        for cap in UPLOAD_PACK_PARTIAL_FETCH_CAPS {
+            assert!(offered.contains(&cap), "missing capability {cap}: {caps}");
+        }
+        assert!(!offered.contains(&"allow-any-sha1-in-want"));
 
         // 3,4: refs sorted ascending — feature before main (BTreeMap order),
         // each "<oid> <refname>\n", no NUL.
@@ -3838,6 +3893,211 @@ mod track_c_tests {
 
         // 5: trailing flush
         assert!(frames[5].is_empty());
+    }
+
+    /// A stand-in for the two read routes, without auth or object storage:
+    /// the advertisement comes from the manifest fast path or from the
+    /// fallback's command line, and the pack from `stream_git_read`.
+    #[derive(Clone)]
+    struct PartialFetchServer {
+        repo: std::path::PathBuf,
+        /// `Some` serves the fast-path advertisement, `None` the fallback's.
+        manifest: Option<Manifest>,
+        permits: Arc<tokio::sync::Semaphore>,
+    }
+
+    async fn partial_fetch_info_refs(State(server): State<PartialFetchServer>) -> Response {
+        let body = match &server.manifest {
+            Some(manifest) => build_upload_pack_advertisement(manifest),
+            None => {
+                let output = git_service_command("upload-pack")
+                    .arg("--advertise-refs")
+                    .arg(&server.repo)
+                    .output()
+                    .await
+                    .expect("run upload-pack --advertise-refs");
+                assert!(output.status.success(), "advertise-refs failed");
+                let mut body = Vec::new();
+                pkt_line(&mut body, b"# service=git-upload-pack\n");
+                body.extend_from_slice(b"0000");
+                body.extend_from_slice(&output.stdout);
+                body
+            }
+        };
+        Response::builder()
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-upload-pack-advertisement",
+            )
+            .body(Body::from(body))
+            .expect("advertisement response")
+    }
+
+    async fn partial_fetch_upload_pack(
+        State(server): State<PartialFetchServer>,
+        headers: axum::http::HeaderMap,
+        body: Body,
+    ) -> Response {
+        let permit = server
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .expect("git permit");
+        let repo = HydratedRepo::for_test(TempDir::new().expect("tempdir"), server.repo.clone());
+        let body = decode_git_request_body(&headers, body, UPLOAD_PACK_MAX_DECODED_BYTES);
+        stream_git_read(
+            repo,
+            permit,
+            "upload-pack",
+            &[],
+            body,
+            Vec::new(),
+            "application/x-git-upload-pack-result".to_string(),
+        )
+        .unwrap_or_else(|response| response)
+    }
+
+    async fn run_git_client(cwd: &Path, args: &[&str]) -> Output {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(cwd).args(args);
+        harden_git_env(&mut cmd);
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
+        cmd.output().await.expect("run git client")
+    }
+
+    fn stdout_line(output: Output, operation: &str) -> String {
+        assert!(
+            output.status.success(),
+            "{operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A stock git client makes a blobless clone and then fetches one blob by
+    /// its object id, against both advertisements. It needs `filter` and
+    /// `allow-reachable-sha1-in-want` offered, and upload-pack run with the
+    /// matching settings: without either half the clone downloads the blob
+    /// up front or the later fetch is refused.
+    #[tokio::test]
+    async fn stock_git_makes_a_blobless_clone_and_fetches_a_blob_by_oid() {
+        let root = TempDir::new().expect("tempdir");
+        let work = root.path().join("work");
+        std::fs::create_dir(&work).expect("create work dir");
+        let identity = [
+            "-c",
+            "user.name=Example",
+            "-c",
+            "user.email=dev@example.org",
+        ];
+        let git = |args: &[&str]| {
+            let args: Vec<&str> = identity.iter().chain(args).copied().collect();
+            stdout_line(run_test_git(&work, &args, &[]), "git")
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        std::fs::write(work.join("README.md"), "partial fetch\n").expect("write README");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "first"]);
+        let tip = git(&["rev-parse", "HEAD"]);
+        let blob = git(&["rev-parse", "HEAD:README.md"]);
+        // A commit no ref reaches, as a force-push leaves behind in the packs.
+        git(&["commit", "--quiet", "--allow-empty", "-m", "dropped"]);
+        let dropped = git(&["rev-parse", "HEAD"]);
+        git(&["reset", "--quiet", "--hard", &tip]);
+        git(&["reflog", "expire", "--expire=now", "--all"]);
+        assert_eq!(git(&["cat-file", "-t", &dropped]), "commit");
+
+        let mut refs = BTreeMap::new();
+        refs.insert("refs/heads/main".to_string(), tip.clone());
+        let manifest = Manifest {
+            version: 1,
+            head: "refs/heads/main".to_string(),
+            refs,
+            packs: vec!["packs/deadbeef".to_string()],
+            parent: None,
+            published_at: None,
+        };
+        assert!(fast_path_eligible(&manifest));
+
+        for (name, manifest) in [("fast-path", Some(manifest)), ("fallback", None)] {
+            let server = PartialFetchServer {
+                repo: work.join(".git"),
+                manifest,
+                permits: Arc::new(tokio::sync::Semaphore::new(4)),
+            };
+            let app = Router::new()
+                .route("/repo.git/info/refs", get(partial_fetch_info_refs))
+                .route("/repo.git/git-upload-pack", post(partial_fetch_upload_pack))
+                .with_state(server);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let url = format!(
+                "http://{}/repo.git",
+                listener.local_addr().expect("local addr")
+            );
+            let serving = tokio::spawn(async move { axum::serve(listener, app).await });
+
+            let advertisement = stdout_line(
+                run_git_client(root.path(), &["ls-remote", &url]).await,
+                "ls-remote",
+            );
+            assert!(advertisement.contains("refs/heads/main"), "{name}");
+
+            let clone = root.path().join(name);
+            let clone_path = clone.to_str().expect("utf-8 path");
+            let cloned = run_git_client(
+                root.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    &url,
+                    clone_path,
+                ],
+            )
+            .await;
+            assert!(
+                cloned.status.success() && cloned.stderr.is_empty(),
+                "{name}: blobless clone: {}",
+                String::from_utf8_lossy(&cloned.stderr)
+            );
+            // Commits and trees arrived; the blob did not.
+            let missing = stdout_line(
+                run_git_client(
+                    &clone,
+                    &["rev-list", "--objects", "--missing=print", "HEAD"],
+                )
+                .await,
+                "rev-list",
+            );
+            assert!(
+                missing.lines().any(|line| line == format!("?{blob}")),
+                "{name}: the clone should lack the blob: {missing}"
+            );
+
+            // Reading the file fetches the blob by object id.
+            let content = stdout_line(
+                run_git_client(&clone, &["cat-file", "-p", "HEAD:README.md"]).await,
+                "lazy blob fetch",
+            );
+            assert_eq!(content, "partial fetch", "{name}");
+
+            // A commit no ref reaches stays out of reach.
+            let refused = run_git_client(&clone, &["fetch", "--quiet", "origin", &dropped]).await;
+            assert!(
+                !refused.status.success(),
+                "{name}: fetched a dropped commit"
+            );
+            assert!(
+                String::from_utf8_lossy(&refused.stderr).contains("not our ref"),
+                "{name}: {}",
+                String::from_utf8_lossy(&refused.stderr)
+            );
+
+            serving.abort();
+        }
     }
 
     #[test]

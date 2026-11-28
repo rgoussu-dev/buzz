@@ -190,6 +190,35 @@ async fn platform_migration_marks_existing_and_old_gateway_rows_ios() {
             .await
             .is_err()
     );
+    // A browser installation is refused until the fork's migrations (9001,
+    // then its validation) widen the check; other values stay refused.
+    let to_web = "UPDATE push_gateway_installations SET platform = 'web' WHERE id = $1";
+    assert!(sqlx::query(to_web)
+        .bind(old_gateway)
+        .execute(&pool)
+        .await
+        .is_err());
+    migrate_gateway_through(&pool, 9002).await.unwrap();
+    sqlx::query(to_web)
+        .bind(old_gateway)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        sqlx::query("UPDATE push_gateway_installations SET platform = 'windows'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let validated: bool = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint
+         WHERE conname = 'push_gateway_installations_platform_check'
+           AND connamespace = current_schema()::regnamespace",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(validated);
     sqlx::raw_sql(AssertSqlSafe(format!(
         "SET search_path TO public; DROP SCHEMA {schema} CASCADE"
     )))

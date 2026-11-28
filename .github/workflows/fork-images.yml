@@ -1,0 +1,188 @@
+name: Fork images
+
+# Builds this fork's relay and push gateway and publishes them to the fork
+# owner's GHCR namespace:
+#
+#   ghcr.io/<owner>/buzz               (Dockerfile, target `runtime`)
+#   ghcr.io/<owner>/buzz-push-gateway  (Dockerfile.push-gateway)
+#
+# It never runs in block/buzz: upstream publishes through docker.yml, which
+# qualifies a source against CI, attests provenance and builds two
+# architectures. This workflow does none of that. It is one job per image, on
+# one architecture, for an operator who deploys their own fork. See
+# docs/fork.md.
+#
+# Tags:
+#   - push to main      → :main, :sha-<7>, :main-<commit UTC>-<7>
+#   - pull request      → :pr-<number> (same-repository branches only; a pull
+#                         request from another fork builds and pushes nothing)
+#   - workflow_dispatch → :<branch>, :sha-<7> of the dispatched ref
+#
+# Each job prints the pushed digest in its summary, so a deployment can pin
+# `image:tag@sha256:…`.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**"
+      - "!desktop/**"
+      - "!mobile/**"
+      - "!docs/**"
+      - "!bin/**"
+      - "!.github/**"
+      - ".github/workflows/fork-images.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.push-gateway"
+      - ".dockerignore"
+      - ".github/workflows/fork-images.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/**"
+      - "migrations/**"
+      - "schema/**"
+      - "web/**"
+      - "admin-web/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+  workflow_dispatch:
+
+# One build per ref. A newer commit on a pull request replaces the build in
+# flight; a main build is never cancelled mid-publish.
+concurrency:
+  group: fork-images-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: {}
+
+jobs:
+  image:
+    name: ${{ matrix.name }}
+    # Forks only, and never for a pull request from someone else's fork: it
+    # would run with a read-only token and could publish nothing.
+    if: >-
+      github.repository != 'block/buzz' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Relay
+            image: buzz
+            dockerfile: ./Dockerfile
+            target: runtime
+            title: Buzz relay (fork build)
+          - name: Push gateway
+            image: buzz-push-gateway
+            dockerfile: ./Dockerfile.push-gateway
+            target: runtime
+            title: Buzz push gateway (fork build)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          # A pull request builds its head commit, not GitHub's merge commit,
+          # so the image is the branch as pushed.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Resolve image name and source
+        id: source
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          # GHCR names are lowercase; an owner's login may not be.
+          echo "image=ghcr.io/${OWNER,,}/${IMAGE}" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        with:
+          # Default parallelism of 4 exhausts the runner's memory during Rust
+          # compiles, as docker.yml notes.
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
+        with:
+          images: ${{ steps.source.outputs.image }}
+          # :latest is never published: a deployment names a build.
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'pull_request' }}
+            type=raw,value=main-{{commit_date 'YYYYMMDDHHmmss'}}-{{sha}},enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          # `source` links the package to this repository, so it takes the
+          # repository's visibility and its Actions token may push to it.
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUZZ_SOURCE_SHA=${{ steps.source.outputs.sha }}
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          cache-from: |
+            type=registry,ref=${{ steps.source.outputs.image }}-buildcache:amd64
+          cache-to: |
+            type=registry,ref=${{ steps.source.outputs.image }}-buildcache:amd64,mode=max,compression=zstd
+
+      - name: Summarize
+        env:
+          IMAGE: ${{ steps.source.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### ${IMAGE}"
+            echo
+            echo "Source: \`${SOURCE_SHA}\`"
+            echo
+            echo "Digest: \`${DIGEST}\`"
+            echo
+            echo "Pin a deployment to one of:"
+            echo
+            echo '```'
+            while IFS= read -r tag; do
+              [[ -n "$tag" ]] && echo "${tag}@${DIGEST}"
+            done <<<"$TAGS"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

@@ -4396,6 +4396,18 @@ struct ThreadContextSessionDelta<'a> {
     delivered_ids: &'a HashSet<String>,
 }
 
+/// Event kinds fetched as a thread's replies for agent context.
+///
+/// Diff messages are included because a revision of a diff under review is
+/// posted as a diff reply in the root diff's thread; without them an agent
+/// asked about "revision 2" would see the discussion but not the revision.
+/// Their content is the unified diff, so they render like any other reply.
+const THREAD_REPLY_KINDS: [u32; 3] = [
+    buzz_core::kind::KIND_STREAM_MESSAGE,
+    buzz_core::kind::KIND_STREAM_MESSAGE_V2,
+    buzz_core::kind::KIND_STREAM_MESSAGE_DIFF,
+];
+
 async fn fetch_thread_context_with<Query, QueryFut, Count, CountFut>(
     channel_id: Uuid,
     root_event_id: &str,
@@ -4434,10 +4446,7 @@ where
     let root_filter = nostr::Filter::new().id(nostr::EventId::from_hex(root_event_id).ok()?);
     let reply_fetch_limit = thread_reply_fetch_limit(limit, session_delta.overfetch);
     let replies_filter = nostr::Filter::new()
-        .kinds([
-            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
-            nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE_V2 as u16),
-        ])
+        .kinds(THREAD_REPLY_KINDS.map(|kind| nostr::Kind::Custom(kind as u16)))
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
         .limit(reply_fetch_limit.saturating_add(1) as usize);
@@ -6883,6 +6892,78 @@ pub(crate) mod tests {
         }
     }
 
+    /// A revision of a diff is a kind 40008 reply in the root diff's thread.
+    /// The reply filters ask for that kind, and the diff reaches the context
+    /// in thread order with its content intact.
+    #[tokio::test]
+    async fn test_fetch_thread_context_includes_diff_replies() {
+        let agent = Keys::generate();
+        let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let channel_id = Uuid::new_v4();
+        let agent_pubkey = agent.public_key();
+        let revision = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new";
+        let with_kind = |mut event: serde_json::Value, kind: u32| {
+            event["kind"] = json!(kind);
+            event
+        };
+        let diff = buzz_core::kind::KIND_STREAM_MESSAGE_DIFF;
+        let message = buzz_core::kind::KIND_STREAM_MESSAGE;
+        let json = json!([
+            with_kind(thread_event(root_id, "authorpub", "revision 1", 1000), diff),
+            with_kind(
+                thread_event(
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "authorpub",
+                    revision,
+                    3000
+                ),
+                diff
+            ),
+            with_kind(
+                thread_event(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "reviewerpub",
+                    "please rename it",
+                    2000
+                ),
+                message
+            ),
+        ]);
+
+        let ctx = fetch_thread_context_with(
+            channel_id,
+            root_id,
+            10,
+            agent_pubkey,
+            move |filters| {
+                assert_thread_query_filters(&filters, channel_id, root_id, agent_pubkey, 11);
+                std::future::ready(Ok(json.clone()))
+            },
+            |_| std::future::ready(Ok(json!({ "count": 2 }))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
+        )
+        .await
+        .expect("thread context");
+
+        match ctx {
+            ConversationContext::Thread {
+                messages,
+                total,
+                truncated,
+                ..
+            } => {
+                assert!(!truncated);
+                assert_eq!(total, 3);
+                let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+                assert_eq!(contents, ["revision 1", "please rename it", revision]);
+            }
+            _ => panic!("expected Thread context"),
+        }
+    }
+
     fn assert_thread_query_filters(
         filters: &[nostr::Filter],
         channel_id: Uuid,
@@ -6901,14 +6982,14 @@ pub(crate) mod tests {
         assert!(root.get("limit").is_none());
 
         let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
-        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(replies.get("kinds"), Some(&json!([9, 40002, 40008])));
         assert_eq!(replies.get("#e"), Some(&json!([root_id])));
         assert_eq!(replies.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(replies.get("limit"), Some(&json!(reply_limit)));
         assert!(replies.get("authors").is_none());
 
         let agent = serde_json::to_value(&filters[2]).expect("serialize agent filter");
-        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(agent.get("kinds"), Some(&json!([9, 40002, 40008])));
         assert_eq!(agent.get("#e"), Some(&json!([root_id])));
         assert_eq!(agent.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(agent.get("authors"), Some(&json!([agent_pubkey.to_hex()])));
@@ -6919,7 +7000,7 @@ pub(crate) mod tests {
         assert_eq!(filters.len(), 1, "count should query only matching replies");
 
         let count = serde_json::to_value(&filters[0]).expect("serialize count filter");
-        assert_eq!(count.get("kinds"), Some(&json!([9, 40002])));
+        assert_eq!(count.get("kinds"), Some(&json!([9, 40002, 40008])));
         assert_eq!(count.get("#e"), Some(&json!([root_id])));
         assert_eq!(count.get("#h"), Some(&json!([channel_id.to_string()])));
         assert_eq!(count.get("limit"), Some(&json!(0)));
