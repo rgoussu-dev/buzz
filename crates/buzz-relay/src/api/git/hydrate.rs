@@ -60,6 +60,19 @@ pub struct HydratedRepo {
 }
 
 impl HydratedRepo {
+    /// Wrap a repository a test built itself, so it can be handed to the
+    /// production subprocess runners. `tempdir` is only kept alive; `path` is
+    /// the repository served.
+    #[cfg(test)]
+    pub(crate) fn for_test(tempdir: TempDir, path: PathBuf) -> Self {
+        Self {
+            _tempdir: tempdir,
+            path,
+            hydrated_bytes: 0,
+            hydrated_packs: 0,
+        }
+    }
+
     /// Path to the bare repository — pass this to `upload-pack`/`info-refs`.
     pub fn path(&self) -> &Path {
         &self.path
