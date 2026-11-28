@@ -13,7 +13,7 @@ from this fork and configured like upstream's behaves like upstream's.
 | Web Push in the push gateway: a `web` installation platform, browser enrollment with a Web Crypto key, RFC 8291/8292 delivery. iOS (APNs) becomes optional, so a gateway can serve browsers alone | `crates/buzz-push-gateway` | `BUZZ_PUSH_VAPID_KEY_PATH`, `BUZZ_PUSH_VAPID_SUBJECT`, `BUZZ_PUSH_CORS_ORIGINS` | [push-gateway-deployment.md](push-gateway-deployment.md#web-push-optional), [buzz-push.md](buzz-push.md#web-push-installations) |
 | The relay advertises `webpush` in NIP-11 `class_support` and accepts browser leases | `crates/buzz-relay` | `BUZZ_PUSH_WEBPUSH_ENABLED=true` (needs `BUZZ_PUSH_ENABLED=true`) | [buzz-push.md](buzz-push.md#web-push-installations) |
 | A forge token hop: two forwarded endpoints so a web page can use GitHub's device flow, advertised in NIP-11 as `buzz_forge_hops` | `crates/buzz-relay` | `BUZZ_FORGE_HOPS` | [forge-hop.md](forge-hop.md) |
-| Partial fetch for git clients: upload-pack advertises `filter` and `allow-reachable-sha1-in-want` | `crates/buzz-relay` | always on | [git-partial-fetch.md](git-partial-fetch.md) |
+| Partial fetch for git clients: upload-pack advertises `filter` and `allow-reachable-sha1-in-want` | `crates/buzz-relay` | always on | [git-on-object-storage.md](git-on-object-storage.md) |
 | buzz-acp gives an agent the diff messages (kind 40008) of the thread it is asked about | `crates/buzz-acp` | always on | — |
 
 The designs were written as proposals for upstream, in
