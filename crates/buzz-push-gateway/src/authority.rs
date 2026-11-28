@@ -31,6 +31,8 @@ pub(crate) const CHALLENGE_QUOTA_MAX_REQUESTS: usize = 600;
 pub enum Platform {
     Ios,
     Android,
+    /// A browser: a Web Push subscription, enrolled with a Web Crypto key.
+    Web,
 }
 
 impl Platform {
@@ -39,6 +41,7 @@ impl Platform {
         match self {
             Platform::Ios => "ios",
             Platform::Android => "android",
+            Platform::Web => "web",
         }
     }
 
@@ -46,6 +49,7 @@ impl Platform {
         match value {
             "ios" => Some(Platform::Ios),
             "android" => Some(Platform::Android),
+            "web" => Some(Platform::Web),
             _ => None,
         }
     }

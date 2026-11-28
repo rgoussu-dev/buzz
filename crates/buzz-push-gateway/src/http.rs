@@ -9,12 +9,14 @@ use crate::{
     },
     config::{
         DELEGATE_AUDIENCE, ENROLL_AUDIENCE, REVOKE_DELEGATION_AUDIENCE,
-        REVOKE_INSTALLATION_AUDIENCE, ROTATE_ENDPOINT_AUDIENCE,
+        REVOKE_INSTALLATION_AUDIENCE, ROTATE_ENDPOINT_AUDIENCE, WEB_ENROLL_AUDIENCE,
+        WEB_ROTATE_ENDPOINT_AUDIENCE,
     },
     grant::GrantKeyring,
     model::*,
     signed_call_limiter::SignedCallLimiter,
     token::TokenKeyring,
+    webpush::{InstallationKey, Subscription},
 };
 use axum::{
     body::Bytes,
@@ -39,13 +41,31 @@ use std::{
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{limit::RequestBodyLimitLayer, timeout::TimeoutLayer};
 
-/// Verification and delivery services for this gateway's configured application.
+/// Verification and delivery services for this gateway's configured
+/// application. Each platform is optional; at least one is configured.
 #[derive(Clone)]
 pub struct ApplicationRuntime {
-    pub app_attest: Arc<AppAttestVerifier>,
-    pub transport: Arc<dyn PushTransport>,
+    /// Present only when the gateway is configured for iOS.
+    pub ios: Option<IosRuntime>,
     /// Present only when the gateway is configured for Android.
     pub android: Option<AndroidRuntime>,
+    /// Present only when the gateway is configured for browsers.
+    pub web: Option<WebRuntime>,
+}
+
+/// App Attest verification and APNs delivery for this gateway's configured app.
+#[derive(Clone)]
+pub struct IosRuntime {
+    pub app_attest: Arc<AppAttestVerifier>,
+    pub transport: Arc<dyn PushTransport>,
+}
+
+/// Web Push identity, accepted push services, and delivery.
+#[derive(Clone)]
+pub struct WebRuntime {
+    pub vapid: Arc<crate::webpush::VapidKey>,
+    pub allowlist: Arc<crate::webpush::PushServiceAllowlist>,
+    pub transport: Arc<dyn PushTransport>,
 }
 
 /// Android attestation and FCM delivery for this gateway's configured app.
@@ -71,6 +91,12 @@ pub struct AppState {
     pub signed_calls: Arc<SignedCallLimiter>,
     pub now: fn() -> i64,
     pub accepting: Arc<AtomicBool>,
+    /// Origins allowed to call the browser routes (CORS). Empty: none.
+    pub cors_origins: Vec<axum::http::HeaderValue>,
+}
+/// A request for a platform this gateway is not configured for.
+fn platform_unavailable() -> Response {
+    error(StatusCode::NOT_FOUND, "platform_unavailable")
 }
 fn error(status: StatusCode, code: &'static str) -> Response {
     (status, Json(ErrorBody { error: code })).into_response()
@@ -171,6 +197,9 @@ fn endpoint_bytes(platform: Platform, endpoint: &str) -> Option<Vec<u8>> {
             .then(|| hex::decode(endpoint).ok())
             .flatten(),
         Platform::Android => valid_fcm_token(endpoint).then(|| endpoint.as_bytes().to_vec()),
+        // A subscription is not one string: browsers enroll and rotate on
+        // their own routes, which build its custody form.
+        Platform::Web => None,
     }
 }
 /// The endpoint string handed to the platform's transport.
@@ -178,6 +207,8 @@ fn transport_endpoint(platform: Platform, token: Vec<u8>) -> Option<String> {
     match platform {
         Platform::Ios => Some(hex::encode(token)),
         Platform::Android => String::from_utf8(token).ok(),
+        // The subscription's custody form is binary; its transport decodes it.
+        Platform::Web => Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)),
     }
 }
 fn endpoint_fingerprint(platform: Platform, token: &[u8]) -> [u8; 32] {
@@ -188,6 +219,9 @@ fn endpoint_fingerprint(platform: Platform, token: &[u8]) -> [u8; 32] {
     h.update(match platform {
         Platform::Ios => &b"buzz-apns-endpoint-v2\0"[..],
         Platform::Android => &b"buzz-fcm-endpoint-v1\0"[..],
+        // Browser routes fingerprint the subscription URL themselves
+        // (`Subscription::fingerprint`); no browser endpoint reaches here.
+        Platform::Web => &b"buzz-webpush-custody-v1\0"[..],
     });
     h.update(token);
     h.finalize().into()
@@ -274,6 +308,7 @@ async fn enroll(State(s): State<AppState>, body: Bytes) -> Response {
     let now = (s.now)();
     // The platform is derived from which attestation is present.
     let platform = match (&r.attestation, &r.android_attestation) {
+        (Some(_), None) if s.application.ios.is_none() => return platform_unavailable(),
         (Some(_), None) => Platform::Ios,
         (None, Some(_)) if s.application.android.is_some() => Platform::Android,
         _ => return error(StatusCode::BAD_REQUEST, "invalid_request"),
@@ -418,8 +453,8 @@ fn verify_enrollment_attestation(
     let rejected = || error(StatusCode::UNAUTHORIZED, "invalid_attestation");
     if let Some(attestation) = &r.attestation {
         let key_id = r.key_id.as_deref().ok_or_else(rejected)?;
-        let verified = s
-            .application
+        let ios = s.application.ios.as_ref().ok_or_else(rejected)?;
+        let verified = ios
             .app_attest
             .verify_attestation(attestation, key_id, transcript)
             .map_err(|_| rejected())?;
@@ -518,6 +553,9 @@ async fn verify_installation_assertion<T: serde::Serialize>(
     let counter = match installation.platform {
         Platform::Ios => Some(
             s.application
+                .ios
+                .as_ref()
+                .ok_or_else(platform_unavailable)?
                 .app_attest
                 .verify_assertion(
                     assertion,
@@ -537,6 +575,19 @@ async fn verify_installation_assertion<T: serde::Serialize>(
                 assertion,
             )
             .map_err(|_| error(StatusCode::UNAUTHORIZED, "invalid_attestation"))?;
+            None
+        }
+        // A Web Crypto signature over the same transcript bytes. Like
+        // Android, it has no counter: the single-use challenge is the fence.
+        Platform::Web => {
+            if s.application.web.is_none() {
+                return Err(platform_unavailable());
+            }
+            let verified = InstallationKey::from_sec1(&installation.app_attest_public_key)
+                .is_ok_and(|key| key.verify(transcript.as_bytes(), assertion));
+            if !verified {
+                return Err(error(StatusCode::UNAUTHORIZED, "invalid_signature"));
+            }
             None
         }
     };
@@ -686,6 +737,11 @@ async fn rotate_endpoint(State(s): State<AppState>, body: Bytes) -> Response {
         Ok(installation) => installation,
         Err(e) => return e,
     };
+    // A browser replaces its subscription on its own route. Here it answers
+    // as an unknown installation does.
+    if installation.platform == Platform::Web {
+        return error(StatusCode::NOT_FOUND, "not_authorized");
+    }
     // The endpoint's shape depends on the installation's platform.
     let token = match endpoint_bytes(installation.platform, &r.endpoint) {
         Some(v) => v,
@@ -945,12 +1001,13 @@ async fn deliver(
     // An Android installation can exist only on a gateway configured for
     // Android. If that configuration was removed, retry: do not invalidate.
     let transport = match platform {
-        Platform::Ios => Some(Arc::clone(&s.application.transport)),
+        Platform::Ios => s.application.ios.as_ref().map(|i| Arc::clone(&i.transport)),
         Platform::Android => s
             .application
             .android
             .as_ref()
             .map(|a| Arc::clone(&a.transport)),
+        Platform::Web => s.application.web.as_ref().map(|w| Arc::clone(&w.transport)),
     };
     let endpoint = match s
         .token_keyring
@@ -984,6 +1041,7 @@ async fn deliver(
         match platform {
             Platform::Ios => crate::metrics::record_apns_delivery(outcome, seconds),
             Platform::Android => crate::metrics::record_fcm_delivery(outcome, seconds),
+            Platform::Web => crate::metrics::record_webpush_delivery(outcome, seconds),
         }
         let disposition = match outcome {
             DeliveryOutcome::Retry { .. } | DeliveryOutcome::ConfigurationFault => {
@@ -1070,17 +1128,35 @@ pub fn router_with_metrics(
     let enrollment = Router::new()
         .route("/v1/installations", post(enroll))
         .layer(RequestBodyLimitLayer::new(MAX_ENROLL_REQUEST_BYTES));
-    let standard_requests = Router::new()
+    // Routes a browser installation calls from the page: CORS applies here
+    // only. App enrollment and rotation, and relay delivery, never come from
+    // a browser.
+    let mut browser_requests = Router::new()
         .route("/v1/installations/challenges", post(challenge))
+        .route("/v1/installations/web", post(enroll_web))
+        .route("/v1/installations/web/endpoint", post(rotate_web_endpoint))
+        .route("/v1/webpush/key", get(webpush_key))
         .route("/v1/delegations", post(delegate))
         .route("/v1/delegations/revoke", post(revoke_delegation))
-        .route("/v1/installations/endpoint", post(rotate_endpoint))
         .route("/v1/installations/revoke", post(revoke_installation))
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
+    if !state.cors_origins.is_empty() {
+        browser_requests = browser_requests.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(state.cors_origins.clone())
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([axum::http::header::CONTENT_TYPE])
+                .max_age(Duration::from_secs(3600)),
+        );
+    }
+    let standard_requests = Router::new()
+        .route("/v1/installations/endpoint", post(rotate_endpoint))
         .route(DELIVERY_PATH, post(deliver))
         .route(APNS_DELIVERY_ALIAS_PATH, post(deliver))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BYTES));
     let public = Router::new()
         .merge(enrollment)
+        .merge(browser_requests)
         .merge(standard_requests)
         .with_state(state.clone())
         .layer(ConcurrencyLimitLayer::new(256))
@@ -1112,6 +1188,9 @@ pub fn router_with_metrics(
     }
     (public, health)
 }
+
+mod web;
+use web::{enroll_web, rotate_web_endpoint, webpush_key};
 
 #[cfg(test)]
 mod request_limit_tests {
@@ -1152,9 +1231,12 @@ mod request_limit_tests {
                 TokenKeyring::new(vec![TokenKey::new("test", &[2; 32]).unwrap()]).unwrap(),
             ),
             application: Arc::new(ApplicationRuntime {
-                app_attest: Arc::new(app_attest),
-                transport: Arc::new(NeverTransport),
+                ios: Some(IosRuntime {
+                    app_attest: Arc::new(app_attest),
+                    transport: Arc::new(NeverTransport),
+                }),
                 android: None,
+                web: None,
             }),
             max_grant_lifetime_seconds: 86_400,
             max_installation_lifetime_seconds: 86_400,
@@ -1165,6 +1247,7 @@ mod request_limit_tests {
             )),
             now: fixed_now,
             accepting: Arc::new(AtomicBool::new(true)),
+            cors_origins: Vec::new(),
         }
     }
 
@@ -1409,3 +1492,6 @@ mod transcript_vector_tests {
 #[cfg(test)]
 #[path = "http_android_tests.rs"]
 mod android_tests;
+#[cfg(test)]
+#[path = "http_web_tests.rs"]
+mod web_tests;

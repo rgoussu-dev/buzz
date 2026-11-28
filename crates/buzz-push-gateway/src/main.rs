@@ -13,6 +13,7 @@ use buzz_push_gateway::{
     router_with_metrics,
     signed_call_limiter::SignedCallLimiter,
     token::{TokenKey, TokenKeyring},
+    webpush::{PushServiceAllowlist, VapidKey, WebPushTransport},
     AppState,
 };
 use std::{
@@ -49,21 +50,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c = Config::from_env()?;
     let metrics_handle = buzz_push_gateway::metrics::install()?;
-    let app_attest_root = fs::read(&c.app_attest_root_cert_path)?;
-    let configured = &c.application;
     let mut refresh_tasks = Vec::new();
     let application = {
-        let apple = AppAttestVerifier::with_environment(
-            configured.app_attest_app_id.clone(),
-            app_attest_root,
-            configured.app_attest_environment,
-        )?;
-        tracing::info!(environment = ?apple.environment(), "App Attest verifier configured");
-        let transport = Arc::new(ApnsTransport::certificate(
-            &fs::read(&configured.apns_cert_path)?,
-            configured.apns_topic.clone(),
-            configured.apns_environment,
-        )?);
+        let ios = c
+            .application
+            .as_ref()
+            .map(|configured| -> Result<_, Box<dyn std::error::Error>> {
+                let apple = AppAttestVerifier::with_environment(
+                    configured.app_attest_app_id.clone(),
+                    fs::read(&configured.app_attest_root_cert_path)?,
+                    configured.app_attest_environment,
+                )?;
+                tracing::info!(environment = ?apple.environment(), "App Attest verifier configured");
+                let transport = Arc::new(ApnsTransport::certificate(
+                    &fs::read(&configured.apns_cert_path)?,
+                    configured.apns_topic.clone(),
+                    configured.apns_environment,
+                )?);
+                Ok(buzz_push_gateway::http::IosRuntime {
+                    app_attest: Arc::new(apple),
+                    transport,
+                })
+            })
+            .transpose()?;
+        let web = c
+            .webpush
+            .as_ref()
+            .map(|configured| -> Result<_, Box<dyn std::error::Error>> {
+                let vapid = Arc::new(VapidKey::from_pem(
+                    &fs::read_to_string(&configured.vapid_key_path)?,
+                    &configured.vapid_subject,
+                )?);
+                let allowlist = Arc::new(PushServiceAllowlist::new(
+                    configured.allowed_hosts.iter().map(String::as_str),
+                )?);
+                let transport = Arc::new(WebPushTransport::new(
+                    vapid.clone(),
+                    allowlist.clone(),
+                    || chrono::Utc::now().timestamp(),
+                )?);
+                tracing::info!(
+                    services = configured.allowed_hosts.len(),
+                    "Web Push transport configured"
+                );
+                Ok(buzz_push_gateway::http::WebRuntime {
+                    vapid,
+                    allowlist,
+                    transport,
+                })
+            })
+            .transpose()?;
         let android = c
             .android
             .as_ref()
@@ -104,11 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             })
             .transpose()?;
-        buzz_push_gateway::http::ApplicationRuntime {
-            app_attest: Arc::new(apple),
-            transport,
-            android,
-        }
+        buzz_push_gateway::http::ApplicationRuntime { ios, android, web }
     };
     let grant_keyring = GrantKeyring::new(
         c.grant_keys
@@ -163,6 +195,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )),
             now: || chrono::Utc::now().timestamp(),
             accepting: accepting.clone(),
+            cors_origins: c
+                .cors_origins
+                .iter()
+                .map(|origin| axum::http::HeaderValue::from_str(origin))
+                .collect::<Result<_, _>>()?,
         },
         Some(metrics_handle),
     );

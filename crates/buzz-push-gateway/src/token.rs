@@ -1,4 +1,4 @@
-//! APNs token custody. Ciphertexts are self-describing and can be decrypted by
+//! Endpoint custody: APNs and FCM tokens and Web Push subscriptions. Ciphertexts are self-describing and can be decrypted by
 //! the current key or bounded decrypt-only predecessors during key rotation.
 use aes_gcm::{
     aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
@@ -11,6 +11,10 @@ use thiserror::Error;
 const AAD_PREFIX: &[u8] = b"buzz-apns-token-v1:";
 const MAX_KEY_ID_BYTES: usize = 32;
 const MAX_CIPHERTEXT_BYTES: usize = 2048;
+/// Longest endpoint accepted for custody. Sealed, it stays within
+/// [`MAX_CIPHERTEXT_BYTES`] and the store's column bound. Each platform bounds
+/// its own endpoints more tightly; a browser subscription is the longest.
+pub const MAX_CUSTODY_BYTES: usize = 1024;
 
 #[derive(Clone)]
 pub struct TokenKey {
@@ -67,7 +71,7 @@ impl TokenKeyring {
         })
     }
     pub fn seal(&self, token: &[u8]) -> Result<Vec<u8>, TokenError> {
-        if token.is_empty() || token.len() > crate::model::MAX_ENDPOINT_HEX_BYTES {
+        if token.is_empty() || token.len() > MAX_CUSTODY_BYTES {
             return Err(TokenError::Invalid);
         }
         let mut nonce = [0; 12];

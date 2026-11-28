@@ -1,4 +1,4 @@
-//! Stateful, capability-gated APNs and FCM last hop for NIP-PL.
+//! Stateful, capability-gated APNs, FCM and Web Push last hop for NIP-PL.
 pub mod android_attestation;
 pub mod apns;
 pub mod app_attest;
@@ -16,6 +16,7 @@ pub mod postgres;
 pub mod signed_call_limiter;
 pub(crate) mod strict_json;
 pub mod token;
+pub mod webpush;
 pub use http::{router, router_with_metrics, AppState};
 
 #[cfg(test)]

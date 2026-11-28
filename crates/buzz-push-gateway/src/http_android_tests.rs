@@ -78,18 +78,21 @@ fn gateway_with(
             TokenKeyring::new(vec![TokenKey::new("test", &[2; 32]).unwrap()]).unwrap(),
         ),
         application: Arc::new(ApplicationRuntime {
-            app_attest: Arc::new(
-                AppAttestVerifier::new(
-                    "TEAMID.com.example.buzz".into(),
-                    include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
-                )
-                .unwrap(),
-            ),
-            transport: Arc::new(NeverApns),
+            ios: Some(IosRuntime {
+                app_attest: Arc::new(
+                    AppAttestVerifier::new(
+                        "TEAMID.com.example.buzz".into(),
+                        include_bytes!("../tests/fixtures/apple-app-attestation-root.pem").to_vec(),
+                    )
+                    .unwrap(),
+                ),
+                transport: Arc::new(NeverApns),
+            }),
             android: attestation.map(|attestation| AndroidRuntime {
                 attestation,
                 transport: fcm.clone(),
             }),
+            web: None,
         }),
         max_grant_lifetime_seconds: 600,
         max_installation_lifetime_seconds: 600,
@@ -101,6 +104,7 @@ fn gateway_with(
         )),
         now: fixed_now,
         accepting: Arc::new(AtomicBool::new(true)),
+        cors_origins: Vec::new(),
     });
     Gateway {
         app,

@@ -69,9 +69,10 @@ addition: `buzz-push-v1` is unchanged, and clients that know only `apns`
 keep working. Set it only when the relay's gateway has Web Push configured.
 
 A gateway with Web Push configured also enrolls browsers. They follow the
-same installation, delegation and lease model as the iOS app, with two
+same installation, delegation and lease model as the apps, with two
 differences: the endpoint is a Web Push subscription, and a non-extractable
-Web Crypto ECDSA P-256 key stands in for App Attest.
+Web Crypto ECDSA P-256 key stands in for the attested key. The gateway records
+such an installation with the platform `web`.
 
 - `GET /v1/webpush/key` returns `{"public_key": "<base64url>"}`, the VAPID
   key to pass as `applicationServerKey`.
@@ -83,7 +84,7 @@ Web Crypto ECDSA P-256 key stands in for App Attest.
   `pushsubscriptionchange`:
   `{v, challenge_id, challenge, installation_handle, endpoint_epoch, new_endpoint_epoch, subscription, signature}`.
 - `POST /v1/delegations`, `/v1/delegations/revoke` and
-  `/v1/installations/revoke` take the same bodies as for iOS; `assertion`
+  `/v1/installations/revoke` take the same bodies as for the apps; `assertion`
   is the installation key's signature.
 
 Each signature is Web Crypto's `ECDSA`/`SHA-256` output (raw `r || s`),
